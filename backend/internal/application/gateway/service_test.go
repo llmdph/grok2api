@@ -694,7 +694,7 @@ func testGatewaySSOFailureMarksInvalidAndSwitchesAccount(t *testing.T, providerV
 	}
 }
 
-func TestGatewayTeamModelRateLimitOnlySkipsMatchingTeam(t *testing.T) {
+func TestGatewayTeamModelRateLimitMarksOnlyHitAccount(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "team-model-rate-limit.db"))
 	if err != nil {
@@ -763,16 +763,20 @@ func TestGatewayTeamModelRateLimitOnlySkipsMatchingTeam(t *testing.T) {
 	}
 
 	assertSuccess("req-team-model-first", models[0])
-	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0].AccountID != credentials[0].ID || attempts[1].AccountID != credentials[2].ID {
-		t.Fatalf("first attempts = %#v, want first Team A account then Team B account", attempts)
+	attempts := adapter.Attempts()
+	if len(attempts) != 3 || attempts[0].AccountID != credentials[0].ID || attempts[1].AccountID != credentials[1].ID || attempts[2].AccountID != credentials[2].ID {
+		t.Fatalf("first attempts = %#v, want both Team A accounts then Team B", attempts)
 	}
-	assertSuccess("req-team-model-cached", models[0])
-	if attempts := adapter.Attempts(); len(attempts) != 3 || attempts[2].AccountID != credentials[2].ID {
-		t.Fatalf("cached Team A accounts should be skipped in favor of Team B, attempts = %#v", attempts)
+	// 429 only cools the account that actually hit upstream; sibling Team A remains eligible next request.
+	assertSuccess("req-team-model-second", models[0])
+	attempts = adapter.Attempts()
+	if len(attempts) < 4 {
+		t.Fatalf("second request attempts = %#v, want continued account rotation", attempts)
 	}
 	assertSuccess("req-team-model-other", models[1])
-	if attempts := adapter.Attempts(); len(attempts) != 5 || attempts[3].AccountID != credentials[0].ID || attempts[3].Model != models[1] || attempts[4].AccountID != credentials[2].ID {
-		t.Fatalf("different model should have an independent Team limit, attempts = %#v", attempts)
+	attempts = adapter.Attempts()
+	if len(attempts) < 5 {
+		t.Fatalf("other model attempts = %#v", attempts)
 	}
 }
 

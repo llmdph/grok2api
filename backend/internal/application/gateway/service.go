@@ -435,6 +435,22 @@ func (s *Service) markTeamModelRateLimit(credential accountdomain.Credential, up
 	return value
 }
 
+func (s *Service) rememberObservedTeamID(credential accountdomain.Credential, teamID string) {
+	teamID = strings.TrimSpace(teamID)
+	if credential.ID == 0 || teamID == "" || strings.TrimSpace(credential.TeamID) != "" {
+		return
+	}
+	accountID := credential.ID
+	providerValue := credential.Provider
+	go func() {
+		writeCtx, cancel := context.WithTimeout(context.Background(), accountStateWriteTimeout)
+		defer cancel()
+		if err := s.accounts.RememberTeamID(writeCtx, accountID, teamID); err != nil {
+			s.logger.Warn("account_team_id_backfill_failed", "account_id", accountID, "provider", providerValue, "error", err)
+		}
+	}()
+}
+
 func (s *Service) SetLogger(logger *slog.Logger) {
 	if logger != nil {
 		s.logger = logger
@@ -961,24 +977,6 @@ attemptLoop:
 			break
 		}
 		excluded[lease.Credential.ID] = true
-		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
-			lease.Release()
-			lastFailure = &UpstreamFailure{
-				HTTPStatus: http.StatusTooManyRequests, Code: "upstream_rate_limited", PublicMessage: "上游请求频率受限",
-				AccountID: lease.Credential.ID, AccountName: lease.Credential.Name,
-				Fingerprint: "429:team_model_rate_limit", RetryAfter: time.Until(limited.Until),
-			}
-			lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
-			s.logger.Warn("upstream_team_model_rate_limit_active", "request_id", input.RequestID, "account_id", lease.Credential.ID, "provider", route.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "retry_after", lastFailure.RetryAfter.Round(time.Second))
-			// Stored Responses are pinned to one account. Return the cached 429
-			// immediately instead of spinning until the cooldown expires or
-			// replaying the request on the same account.
-			if ownership != nil {
-				break attemptLoop
-			}
-			attempt--
-			continue
-		}
 		if lease.QuotaProbe {
 			quotaProbeAttempted = true
 		}
@@ -1147,20 +1145,19 @@ attemptLoop:
 				if strings.TrimSpace(rateLimitMeta.TeamID) == "" {
 					rateLimitMeta.TeamID = strings.TrimSpace(credential.TeamID)
 				}
-				if rateLimitMeta.TeamID == "" {
-					// Team+Model shielding requires a team identity; fall through to account-scoped 429 handling.
-					goto afterTeamRateLimit
+				// Only the account that actually hit upstream 429 is marked.
+				// Do not shield/exclude sibling accounts under the same team.
+				if rateLimitMeta.TeamID != "" {
+					s.rememberObservedTeamID(credential, rateLimitMeta.TeamID)
 				}
-				limited := s.markTeamModelRateLimit(credential, route.UpstreamModel, rateLimitMeta, time.Now().UTC())
-				lastFailure.AccountScoped = false
+				if rateLimitMeta.RetryAfter > 0 && rateLimitMeta.RetryAfter > retryAfter {
+					retryAfter = rateLimitMeta.RetryAfter
+				}
+				lastFailure.RetryAfter = retryAfter
 				lastFailure.Fingerprint = "429:team_model_rate_limit"
-				lastFailure.RetryAfter = time.Until(limited.Until)
-				lease.Release()
-				lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
-				s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", rateLimitMeta.Scope, "actual", rateLimitMeta.Actual, "limit", rateLimitMeta.Limit, "retry_after", lastFailure.RetryAfter)
-				continue
+				// Keep AccountScoped=true so MarkFailure only cools this account.
+				s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "account_id", credential.ID, "team_id", rateLimitMeta.TeamID, "scope", rateLimitMeta.Scope, "actual", rateLimitMeta.Actual, "limit", rateLimitMeta.Limit, "retry_after", retryAfter)
 			}
-		afterTeamRateLimit:
 			// Grok Build treats only HTTP 401 as an OAuth authentication failure.
 			// A 403 is already authenticated and must not trigger token rotation or
 			// replay the same request with freshly issued credentials.
@@ -1194,7 +1191,11 @@ attemptLoop:
 				goto handleResponse
 			}
 			failureHandled := false
-			if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
+			// Ordinary upstream 429 (RPS/RPM/concurrency) is not quota depletion.
+			// Only exhaust local quota windows when the error body actually says so;
+			// otherwise multi-account pools shrink themselves into hotter 429 loops.
+			if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests &&
+				(lastFailure.QuotaExhausted || lastFailure.FreeQuotaExhausted || lastFailure.ModelQuotaExhausted) {
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
 				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
 				failureHandled = reconcileErr == nil && exhausted

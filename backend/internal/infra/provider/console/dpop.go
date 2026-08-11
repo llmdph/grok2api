@@ -115,7 +115,7 @@ func (m *dpopSessionManager) get(
 		if session, ok := m.cached(key); ok {
 			return session, nil
 		}
-		session, fetchErr := adapter.fetchDPoPSession(ctx, ssoToken, lease)
+		session, fetchErr := adapter.fetchDPoPSession(ctx, credential, ssoToken, lease)
 		if fetchErr != nil {
 			return dpopSession{}, fetchErr
 		}
@@ -198,7 +198,7 @@ func dpopSessionCacheKey(baseURL string, credential account.Credential, ssoToken
 		strconv.FormatUint(credential.ID, 10) + "|" + strconv.FormatUint(nodeID, 10) + "|" + security.HashToken(ssoToken)
 }
 
-func (a *Adapter) fetchDPoPSession(ctx context.Context, ssoToken string, lease *infraegress.Lease) (dpopSession, error) {
+func (a *Adapter) fetchDPoPSession(ctx context.Context, credential account.Credential, ssoToken string, lease *infraegress.Lease) (dpopSession, error) {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return dpopSession{}, fmt.Errorf("生成 Console DPoP 密钥: %w", err)
@@ -213,7 +213,7 @@ func (a *Adapter) fetchDPoPSession(ctx context.Context, ssoToken string, lease *
 	if err != nil {
 		return dpopSession{}, err
 	}
-	applyBrowserHeaders(request, ssoToken, lease)
+	applyBrowserHeaders(request, ssoToken, lease, credential)
 	request.Header.Set("Content-Type", "application/json")
 	localBefore := time.Now().UTC()
 	response, err := lease.DoDeferredForbidden(request)
@@ -306,7 +306,7 @@ func (a *Adapter) doDPoPRequest(
 		if err != nil {
 			return nil, err
 		}
-		applyBrowserHeaders(request, ssoToken, lease)
+		applyBrowserHeaders(request, ssoToken, lease, credential)
 		if len(body) > 0 {
 			request.Header.Set("Content-Type", "application/json")
 		}
@@ -455,3 +455,6 @@ func consoleV1Endpoint(baseURL, path string) string {
 	}
 	return baseURL + "/v1" + path
 }
+
+
+

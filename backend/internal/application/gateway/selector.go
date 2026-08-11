@@ -56,6 +56,10 @@ const modelAccessDeniedCooldown = 5 * time.Minute
 // softNetworkCooldown 网络/超时/5xx 仅短暂隔离本号，避免指数冷却掏空热池。
 const softNetworkCooldown = 5 * time.Second
 
+// softRateLimitCooldown keeps ordinary 429s from exponentially freezing the pool.
+// Retry-After still wins when the upstream asks for a longer pause.
+const softRateLimitCooldown = 8 * time.Second
+
 const defaultFreeQuotaRecoveryPause = 24 * time.Hour
 
 var errRoutingCredentialStale = errors.New("routing credential is no longer available")
@@ -275,6 +279,7 @@ type Selector struct {
 	leaseWake              chan struct{}
 	lastSelectedAt         map[uint64]time.Time
 	lastSuccessAt          map[uint64]time.Time
+	localCooldowns         map[uint64]time.Time
 	quotaConsumed          map[quotaConsumptionKey]int
 	staleFallbackLoggedAt  map[string]time.Time
 	candidates             map[candidateCacheKey]candidateSnapshot
@@ -299,7 +304,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), localCooldowns: make(map[uint64]time.Time), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 // SetLogger wires the application logger into routing degradation diagnostics.
@@ -471,9 +476,9 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			earliestRetry = earlierFuture(earliestRetry, candidate.ModelQuotaBlock.CooldownUntil, now)
 			continue
 		}
-		if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
+		if cooldownUntil, cooling := s.accountCooldownUntil(value, now); cooling {
 			coolingCandidates++
-			earliestRetry = earlierFuture(earliestRetry, *value.CooldownUntil, now)
+			earliestRetry = earlierFuture(earliestRetry, cooldownUntil, now)
 			continue
 		}
 		quotaRecovery := candidate.QuotaRecovery
@@ -760,8 +765,8 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 			if candidate.ModelQuotaBlock != nil && now.Before(candidate.ModelQuotaBlock.CooldownUntil) {
 				return nil, &SelectionUnavailableError{Reason: SelectionModelCooling, RetryAfter: retryDelay(now, candidate.ModelQuotaBlock.CooldownUntil)}
 			}
-			if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
-				return nil, &SelectionUnavailableError{Reason: SelectionCooling, RetryAfter: retryDelay(now, *value.CooldownUntil)}
+			if cooldownUntil, cooling := s.accountCooldownUntil(value, now); cooling {
+				return nil, &SelectionUnavailableError{Reason: SelectionCooling, RetryAfter: retryDelay(now, cooldownUntil)}
 			}
 			if recovery := candidate.QuotaRecovery; recovery != nil && recovery.Status != account.QuotaRecoveryStatusActive {
 				if recovery.NextProbeAt == nil || now.Before(*recovery.NextProbeAt) {
@@ -869,6 +874,7 @@ func (s *Selector) MarkSuccess(ctx context.Context, credential account.Credentia
 
 func (s *Selector) markSuccess(ctx context.Context, credential account.Credential, quotaProbe bool) {
 	now := time.Now().UTC()
+	s.clearLocalCooldown(credential.ID)
 	persist := credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != ""
 	s.selectionMu.Lock()
 	if last := s.lastSuccessAt[credential.ID]; last.IsZero() || now.Sub(last) >= successPersistInterval {
@@ -1047,6 +1053,65 @@ func (s *Selector) clearQuotaConsumptionAccount(provider account.Provider, accou
 	s.quotaMu.Unlock()
 }
 
+
+func cloneTime(value time.Time) *time.Time {
+	cloned := value.UTC()
+	return &cloned
+}
+
+// accountCooldownUntil returns the later of durable and process-local cooldowns.
+// Soft 429/network failures arm the local map first so other requests can skip
+// the hot account before the async health write lands.
+func (s *Selector) accountCooldownUntil(credential account.Credential, now time.Time) (time.Time, bool) {
+	var until time.Time
+	if credential.CooldownUntil != nil && now.Before(*credential.CooldownUntil) {
+		until = credential.CooldownUntil.UTC()
+	}
+	s.selectionMu.RLock()
+	localUntil, ok := s.localCooldowns[credential.ID]
+	s.selectionMu.RUnlock()
+	if ok {
+		if now.Before(localUntil) {
+			if until.IsZero() || localUntil.After(until) {
+				until = localUntil
+			}
+		} else {
+			s.selectionMu.Lock()
+			if current, exists := s.localCooldowns[credential.ID]; exists && !now.Before(current) {
+				delete(s.localCooldowns, credential.ID)
+			}
+			s.selectionMu.Unlock()
+		}
+	}
+	if until.IsZero() {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+func (s *Selector) rememberLocalCooldown(accountID uint64, until time.Time) {
+	if accountID == 0 || until.IsZero() {
+		return
+	}
+	s.selectionMu.Lock()
+	if s.localCooldowns == nil {
+		s.localCooldowns = make(map[uint64]time.Time)
+	}
+	if current, ok := s.localCooldowns[accountID]; !ok || until.After(current) {
+		s.localCooldowns[accountID] = until.UTC()
+	}
+	s.selectionMu.Unlock()
+}
+
+func (s *Selector) clearLocalCooldown(accountID uint64) {
+	if accountID == 0 {
+		return
+	}
+	s.selectionMu.Lock()
+	delete(s.localCooldowns, accountID)
+	s.selectionMu.Unlock()
+}
+
 func (s *Selector) MarkFailure(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) {
 	_ = s.markFailure(ctx, credential, credential.FailureCount+1, status, retryAfter)
 }
@@ -1063,6 +1128,8 @@ func (s *Selector) markFailure(ctx context.Context, credential account.Credentia
 	// 网络/超时（status 0）只短隔离本号，不累加失败次数，避免瞬时抖动把号池指数冻空。
 	// 上游返回的 4xx/5xx 仍按原指数冷却：那是上游明确给出的状态，不是本地网络抖动。
 	softNetwork := status == 0
+	softRateLimit := status == http.StatusTooManyRequests
+	softFailure := softNetwork || softRateLimit
 	effectiveFailureCount := failureCount
 	cooldown := cooldownBase
 	if softNetwork {
@@ -1070,6 +1137,16 @@ func (s *Selector) markFailure(ctx context.Context, credential account.Credentia
 		cooldown = softNetworkCooldown
 		if retryAfter > cooldown {
 			cooldown = retryAfter
+		}
+	} else if softRateLimit {
+		// Keep the account in the pool; only pause briefly so siblings can absorb traffic.
+		effectiveFailureCount = credential.FailureCount
+		cooldown = softRateLimitCooldown
+		if retryAfter > cooldown {
+			cooldown = retryAfter
+		}
+		if cooldown > cooldownMax {
+			cooldown = cooldownMax
 		}
 	} else {
 		for i := 1; i < effectiveFailureCount && cooldown < cooldownMax; i++ {
@@ -1083,6 +1160,28 @@ func (s *Selector) markFailure(ctx context.Context, credential account.Credentia
 		}
 	}
 	until := time.Now().UTC().Add(cooldown)
+	// Soft failures must not block the request path on durable health writes.
+	// Arm a process-local cooldown and drop only this account from the candidate
+	// snapshot so the current request can rotate immediately.
+	if softFailure {
+		s.rememberLocalCooldown(credential.ID, until)
+		s.evictCandidate(credential.Provider, credential.ID)
+		accountID := credential.ID
+		providerValue := credential.Provider
+		lastError := fmt.Sprintf("upstream status %d", status)
+		clearSticky := status == http.StatusTooManyRequests
+		go func() {
+			writeCtx, cancel := context.WithTimeout(context.Background(), accountStateWriteTimeout)
+			defer cancel()
+			if err := s.accounts.UpdateHealth(writeCtx, accountID, effectiveFailureCount, cloneTime(until), lastError, false); err != nil {
+				s.logger.Warn("account_soft_failure_health_write_failed", "account_id", accountID, "provider", providerValue, "status", status, "error", err)
+			}
+			if clearSticky {
+				_ = s.sticky.DeleteByAccount(writeCtx, accountID)
+			}
+		}()
+		return nil
+	}
 	healthErr := s.accounts.UpdateHealth(ctx, credential.ID, effectiveFailureCount, &until, fmt.Sprintf("upstream status %d", status), false)
 	s.invalidateCandidates(credential.Provider)
 	if status == 401 || status == 402 || status == 403 || status == 429 {

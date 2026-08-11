@@ -4,20 +4,50 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/browserheaders"
 )
 
-func applyBrowserHeaders(request *http.Request, token string, lease *infraegress.Lease) {
-	userAgent := strings.TrimSpace(lease.UserAgent)
+func applyBrowserHeaders(request *http.Request, token string, lease *infraegress.Lease, credential account.Credential) {
+	accountKey := ""
+	if lease != nil {
+		accountKey = strings.TrimSpace(lease.AccountIdentity)
+	}
+	if accountKey == "" || accountKey == "shared" {
+		accountKey = accountBrowserKey(credential.ID, credential.EgressIdentity)
+	}
+	identity := browserIdentityForAccount(accountKey)
+
+	userAgent := ""
+	if lease != nil {
+		userAgent = strings.TrimSpace(lease.UserAgent)
+	}
+	if userAgent == "" {
+		userAgent = strings.TrimSpace(identity.UserAgent)
+	}
 	if userAgent == "" {
 		userAgent = infraegress.DefaultUserAgent
 	}
+
+	acceptLanguage := strings.TrimSpace(identity.AcceptLanguage)
+	if acceptLanguage == "" {
+		acceptLanguage = "zh-CN,zh;q=0.9,en;q=0.8"
+	}
+	acceptEncoding := strings.TrimSpace(identity.AcceptEncoding)
+	if acceptEncoding == "" {
+		acceptEncoding = "gzip, deflate, br, zstd"
+	}
+
 	request.Header.Set("Accept", "*/*")
-	request.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	request.Header.Set("Accept-Encoding", acceptEncoding)
+	request.Header.Set("Accept-Language", acceptLanguage)
 	request.Header.Set("Cache-Control", "no-cache")
-	request.Header.Set("Cookie", infraegress.BuildSSOCookie(token, lease.CFCookies))
+	cfCookies := ""
+	if lease != nil {
+		cfCookies = lease.CFCookies
+	}
+	request.Header.Set("Cookie", infraegress.BuildSSOCookie(token, cfCookies))
 	request.Header.Set("Origin", "https://console.x.ai")
 	request.Header.Set("Referer", "https://console.x.ai/")
 	request.Header.Set("Sec-Fetch-Dest", "empty")

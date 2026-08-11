@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"io"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -244,11 +246,20 @@ func (s *Service) executeImage(
 		}
 		if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && response.StatusCode == http.StatusTooManyRequests && lease.QuotaMode != "" {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
-			exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-			s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
-			if reconcileErr != nil || !exhausted {
+			body, _ := readRetryableBody(response.Body)
+			classified := newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			// Only treat explicit quota exhaustion as window depletion. Ordinary
+			// rate limits stay as short account cooldowns.
+			if classified.QuotaExhausted || classified.FreeQuotaExhausted || classified.ModelQuotaExhausted {
+				exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
+				if reconcileErr != nil || !exhausted {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
+			} else {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			}
+			response.Body = io.NopCloser(bytes.NewReader(body))
 			if attemptPolicy.hasNext(attempt) {
 				_, _ = readRetryableBody(response.Body)
 				lease.Release()

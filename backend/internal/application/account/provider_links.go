@@ -74,6 +74,18 @@ func (s *Service) syncAccountIdentity(ctx context.Context, id uint64) error {
 	return mapRepositoryError(links.ReconcileProviderLinks(ctx, id))
 }
 
+func (s *Service) RememberTeamID(ctx context.Context, accountID uint64, teamID string) error {
+	teamID = strings.TrimSpace(teamID)
+	if accountID == 0 || teamID == "" {
+		return nil
+	}
+	links, ok := s.accounts.(providerLinkRepository)
+	if !ok {
+		return nil
+	}
+	return mapRepositoryError(links.UpdateIdentityMetadata(ctx, accountID, "", "", teamID))
+}
+
 func accountIdentityComplete(value accountdomain.Credential) bool {
 	if value.Provider == accountdomain.ProviderWeb {
 		identityID, err := uuid.Parse(strings.TrimSpace(value.UserID))

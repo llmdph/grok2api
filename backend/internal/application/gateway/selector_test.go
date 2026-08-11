@@ -1360,31 +1360,42 @@ func TestMarkFailureSoftNetworkCooldown(t *testing.T) {
 	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 500*time.Millisecond)
 	before := time.Now().UTC()
 	selector.MarkFailure(ctx, credential, 0, 0)
-	updated, err := accounts.Get(ctx, credential.ID)
-	if err != nil {
-		t.Fatal(err)
+	if until, ok := selector.accountCooldownUntil(credential, time.Now().UTC()); !ok || until.Sub(before) < 4*time.Second || until.Sub(before) > 6*time.Second {
+		t.Fatalf("local soft network cooldown = %v ok=%t", until, ok)
 	}
+	updated := waitAccountCooldown(t, accounts, credential.ID, before, 4*time.Second, 6*time.Second)
 	if updated.FailureCount != 0 {
 		t.Fatalf("soft network failure count = %d, want 0", updated.FailureCount)
 	}
-	if updated.CooldownUntil == nil {
-		t.Fatal("expected short cooldown")
-	}
-	cooldown := updated.CooldownUntil.Sub(before)
-	if cooldown < 4*time.Second || cooldown > 6*time.Second {
-		t.Fatalf("soft network cooldown = %s, want ~5s", cooldown)
-	}
 
 	selector.MarkFailure(ctx, updated, http.StatusTooManyRequests, 0)
-	hard, err := accounts.Get(ctx, credential.ID)
-	if err != nil {
-		t.Fatal(err)
+	if until, ok := selector.accountCooldownUntil(updated, time.Now().UTC()); !ok || until.Sub(time.Now().UTC()) < 6*time.Second {
+		t.Fatalf("local soft rate-limit cooldown missing/too short: %v ok=%t", until, ok)
 	}
-	if hard.FailureCount != 1 {
-		t.Fatalf("hard failure count = %d, want 1", hard.FailureCount)
+	softRate := waitAccountCooldown(t, accounts, credential.ID, time.Now().UTC().Add(-time.Second), 6*time.Second, 10*time.Second)
+	if softRate.FailureCount != 0 {
+		t.Fatalf("soft rate-limit failure count = %d, want 0", softRate.FailureCount)
 	}
-	if hard.CooldownUntil == nil || hard.CooldownUntil.Sub(time.Now().UTC()) < 20*time.Second {
-		t.Fatalf("hard cooldown too short: %v", hard.CooldownUntil)
+}
+
+func waitAccountCooldown(t *testing.T, accounts repository.AccountRepository, accountID uint64, notBefore time.Time, minCooldown, maxCooldown time.Duration) account.Credential {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		updated, err := accounts.Get(context.Background(), accountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.CooldownUntil != nil {
+			cooldown := updated.CooldownUntil.Sub(notBefore)
+			if cooldown >= minCooldown && cooldown <= maxCooldown+time.Second {
+				return updated
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("account cooldown not persisted: cooldownUntil=%v", updated.CooldownUntil)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

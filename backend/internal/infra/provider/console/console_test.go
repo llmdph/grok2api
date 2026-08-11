@@ -107,8 +107,9 @@ func TestSyncAccountIdentityUsesWebSessionWithConsoleCredential(t *testing.T) {
 			http.NotFound(writer, request)
 			return
 		}
-		if request.Header.Get("User-Agent") != infraegress.DefaultUserAgent {
-			t.Errorf("user agent = %q", request.Header.Get("User-Agent"))
+		ua := request.Header.Get("User-Agent")
+		if !strings.Contains(ua, "Chrome/") {
+			t.Errorf("user agent = %q", ua)
 		}
 		if request.Header.Get("Cookie") != "sso=test-sso; sso-rw=test-sso; cf_clearance=clear" {
 			t.Errorf("cookie = %q", request.Header.Get("Cookie"))
@@ -662,12 +663,14 @@ func TestAdapterForwardsConsoleHeadersAndNormalizedBody(t *testing.T) {
 			t.Errorf("headers = %#v", request.Header)
 		}
 		verifyTestDPoPProof(t, request)
-		if request.Header.Get("User-Agent") != infraegress.DefaultUserAgent {
-			t.Errorf("user-agent = %q", request.Header.Get("User-Agent"))
+		ua := request.Header.Get("User-Agent")
+		if !strings.Contains(ua, "Chrome/") {
+			t.Errorf("user-agent = %q", ua)
 		}
-		if request.Header.Get("Sec-Ch-Ua") != `"Google Chrome";v="146", "Chromium";v="146", "Not(A:Brand";v="24"` ||
-			request.Header.Get("Sec-Ch-Ua-Mobile") != "?0" || request.Header.Get("Sec-Ch-Ua-Platform") != `"macOS"` ||
-			request.Header.Get("Sec-Ch-Ua-Arch") != "x86" || request.Header.Get("Sec-Ch-Ua-Bitness") != "64" {
+		if request.Header.Get("Connection") != "close" {
+			t.Errorf("connection = %q", request.Header.Get("Connection"))
+		}
+		if request.Header.Get("Sec-Ch-Ua") == "" || request.Header.Get("Sec-Ch-Ua-Mobile") == "" || request.Header.Get("Sec-Ch-Ua-Platform") == "" {
 			t.Errorf("client hints = %#v", request.Header)
 		}
 		cookie := request.Header.Get("Cookie")

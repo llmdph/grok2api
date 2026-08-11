@@ -67,6 +67,7 @@ type Lease struct {
 	Scope            domain.Scope
 	ProxyURL         string
 	UserAgent        string
+	AccountIdentity  string
 	CFCookies        string
 	client           requestClient
 	browser          *browserClient
@@ -1125,29 +1126,39 @@ func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scop
 			cookies = credentialCookies
 		}
 	}
+	// Derive identity early so Console/Web browser surfaces and clearance leases
+	// can stick to the account instead of the shared node default.
+	accountIdentity := ""
+	if scope != domain.ScopeConsoleAsset {
+		accountIdentity = isolationAccountIdentity(ctx, scope, affinity)
+	}
 	userAgent := ""
 	if scope != domain.ScopeBuild {
 		userAgent = strings.TrimSpace(selected.UserAgent)
 	}
 	if scope != domain.ScopeBuild && userAgent == "" {
-		userAgent = DefaultUserAgent
+		if accountIdentity != "" && accountIdentity != "shared" {
+			userAgent = StickyBrowserUserAgent(accountIdentity)
+		} else {
+			userAgent = DefaultUserAgent
+		}
 	}
 	clearanceKey := ""
 	// Manual mode may prefer account-bound cookies. Managed mode always enters
 	// the FlareSolverr lifecycle so stale imported cookies cannot bypass refresh.
 	if managedClearance {
-		clearanceKey = clearanceCacheKey(selected.ID, proxyURL, sticky)
-		cookies, userAgent, err = m.ensureClearance(ctx, selected, proxyURL, cookies, userAgent, clearanceKey, !sticky)
+		// Partition browser clearance by account identity when available so many
+		// Console accounts on one node do not share one browser surface.
+		clearanceSticky := sticky || (accountIdentity != "" && accountIdentity != "shared")
+		clearanceProxy := proxyURL
+		if !sticky && accountIdentity != "" && accountIdentity != "shared" {
+			clearanceProxy = proxyURL + "\x00account:" + accountIdentity
+		}
+		clearanceKey = clearanceCacheKey(selected.ID, clearanceProxy, clearanceSticky)
+		cookies, userAgent, err = m.ensureClearance(ctx, selected, proxyURL, cookies, userAgent, clearanceKey, !clearanceSticky)
 		if err != nil {
 			return nil, false, err
 		}
-	}
-	// Derive identity independently of the current toggle. clientFor applies one
-	// authoritative toggle snapshot, so enabling isolation between these two
-	// stages cannot accidentally place an account request in the shared bucket.
-	accountIdentity := ""
-	if scope != domain.ScopeConsoleAsset {
-		accountIdentity = isolationAccountIdentity(ctx, scope, affinity)
 	}
 	client, err := m.clientForWithOptions(selected.ID, scope, proxyURL, userAgent, cookies, sticky, accountIdentity, options)
 	if err != nil {
@@ -1156,7 +1167,7 @@ func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scop
 	m.incrementInflight(selected.ID)
 	recordSelection(ctx, Selection{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, Proxied: proxyURL != ""})
 	var once sync.Once
-	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, proxyPool: proxyPool, freshTunnel: freshTunnel, clearanceKey: clearanceKey, clearanceManager: m, release: func() {
+	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, AccountIdentity: accountIdentity, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, proxyPool: proxyPool, freshTunnel: freshTunnel, clearanceKey: clearanceKey, clearanceManager: m, release: func() {
 		once.Do(func() {
 			m.decrementInflight(selected.ID)
 		})
