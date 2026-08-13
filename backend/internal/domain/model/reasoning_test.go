@@ -13,6 +13,8 @@ func TestSupportedReasoningEffortsPerModel(t *testing.T) {
 	}{
 		{model: "grok-4.5", want: []string{"low", "medium", "high"}},
 		{model: "Build/grok-4.5", want: []string{"low", "medium", "high"}},
+		{model: "grok-4.6", want: []string{"low", "medium", "high"}},
+		{model: "Console/grok-4.6", want: []string{"low", "medium", "high"}},
 		{model: "grok-4.3", want: []string{"none", "low", "medium", "high"}},
 		{model: "grok-4.20-0309-reasoning", want: []string{"low", "medium", "high"}},
 		{model: "Console/grok-4.20-0309-reasoning", want: []string{}},
@@ -34,6 +36,9 @@ func TestSupportedReasoningEffortsPerModel(t *testing.T) {
 	}
 	if SupportsReasoningEffort("grok-4.5", "none") || SupportsReasoningEffort("grok-4.5", "xhigh") || SupportsReasoningEffort("grok-4.5", "max") {
 		t.Fatal("grok-4.5 must not advertise none/xhigh/max")
+	}
+	if SupportsReasoningEffort("grok-4.6", "none") || SupportsReasoningEffort("grok-4.6", "xhigh") || SupportsReasoningEffort("grok-4.6", "max") {
+		t.Fatal("grok-4.6 must not advertise none/xhigh/max")
 	}
 	if !SupportsReasoningEffort("grok-4.3", "none") || SupportsReasoningEffort("grok-4.3", "xhigh") {
 		t.Fatal("grok-4.3 effort support mismatch")
