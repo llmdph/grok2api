@@ -1171,8 +1171,10 @@ func captureVideoAttempt(recorder *failureAttemptRecorder, credential account.Cr
 
 func (s *Service) videoAttemptPolicy() routingAttemptPolicy {
 	configured := int(s.videoMaxAttempts.Load())
+	// Legacy installs may still have 0 from the short-lived "inherit" default.
+	// Treat it as the general default pool size instead of reintroducing inherit UI.
 	if configured == 0 {
-		configured = int(s.maxAttempts.Load())
+		configured = 999
 	}
 	return newRoutingAttemptPolicy(configured)
 }

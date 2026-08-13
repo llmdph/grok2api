@@ -436,8 +436,8 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	} else if request.Duration != 0 {
 		return provider.VideoResult{}, errors.New("视频编辑不支持 duration")
 	}
-	if request.Resolution != "" && request.Resolution != "480p" && request.Resolution != "720p" {
-		return provider.VideoResult{}, fmt.Errorf("%s 仅支持 480p 或 720p", modelName)
+	if err := validateConsoleVideoResolution(modelName, request.Resolution); err != nil {
+		return provider.VideoResult{}, err
 	}
 	payload := map[string]any{"model": modelName}
 	if operation == provider.VideoOperationGenerate || operation == provider.VideoOperationExtend {
@@ -773,6 +773,28 @@ func parseConsoleVideoStatus(body []byte, progress func(int)) (provider.VideoRes
 		return provider.VideoResult{}, false, nil
 	default:
 		return provider.VideoResult{}, false, fmt.Errorf("Console 视频状态无效: %q", safeConsoleMediaText(status))
+	}
+}
+
+
+func validateConsoleVideoResolution(modelName, resolution string) error {
+	resolution = strings.TrimSpace(resolution)
+	if resolution == "" {
+		return nil
+	}
+	switch resolution {
+	case "480p", "720p":
+		return nil
+	case "1080p":
+		if strings.TrimSpace(modelName) == "grok-imagine-video-1.5" {
+			return nil
+		}
+		return fmt.Errorf("%s 仅支持 480p 或 720p", modelName)
+	default:
+		if strings.TrimSpace(modelName) == "grok-imagine-video-1.5" {
+			return fmt.Errorf("%s 仅支持 480p、720p 或 1080p", modelName)
+		}
+		return fmt.Errorf("%s 仅支持 480p 或 720p", modelName)
 	}
 }
 

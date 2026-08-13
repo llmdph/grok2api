@@ -409,13 +409,13 @@ func TestResolveVideoAuditStatusCodePrefersUpstream429(t *testing.T) {
 	}
 }
 
-func TestVideoAttemptPolicyInheritsAndOverrides(t *testing.T) {
+func TestVideoAttemptPolicyStandaloneAndUnlimited(t *testing.T) {
 	service := &Service{}
 	service.UpdateMaxAttempts(3)
 	service.UpdateVideoMaxAttempts(0)
 	policy := service.videoAttemptPolicy()
-	if policy.unlimited || policy.limit != 3 {
-		t.Fatalf("inherit policy = %#v", policy)
+	if policy.unlimited || policy.limit != 999 {
+		t.Fatalf("legacy zero policy = %#v", policy)
 	}
 	service.UpdateVideoMaxAttempts(-1)
 	policy = service.videoAttemptPolicy()
@@ -425,6 +425,6 @@ func TestVideoAttemptPolicyInheritsAndOverrides(t *testing.T) {
 	service.UpdateVideoMaxAttempts(5)
 	policy = service.videoAttemptPolicy()
 	if policy.unlimited || policy.limit != 5 {
-		t.Fatalf("override policy = %#v", policy)
+		t.Fatalf("standalone policy = %#v", policy)
 	}
 }

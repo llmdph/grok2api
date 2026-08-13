@@ -1825,3 +1825,16 @@ func TestConsoleVideoEditRejectsNonImagineVideoModel(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+
+func TestValidateConsoleVideoResolution(t *testing.T) {
+	if err := validateConsoleVideoResolution("grok-imagine-video-1.5", "1080p"); err != nil {
+		t.Fatalf("1.5 1080p should be allowed: %v", err)
+	}
+	if err := validateConsoleVideoResolution("grok-imagine-video", "1080p"); err == nil {
+		t.Fatal("base video 1080p should be rejected")
+	}
+	if err := validateConsoleVideoResolution("grok-imagine-video-1.5", "720p"); err != nil {
+		t.Fatalf("1.5 720p should be allowed: %v", err)
+	}
+}

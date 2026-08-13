@@ -275,7 +275,6 @@ export function SettingsPage() {
               <SettingsField controlId="routing-video-max-attempts" label={t("settings.routing.videoMaxAttempts")} description={t("settings.routing.videoMaxAttemptsHelp")} error={form.formState.errors.routing?.videoMaxAttempts?.message}>
                 <Controller control={form.control} name="routing.videoMaxAttempts" render={({ field }) => {
                   const unlimited = field.value === UNLIMITED_ROUTING_ATTEMPTS;
-                  const inherit = field.value === 0;
                   return (
                     <div className="flex h-9 items-center gap-3">
                       <Input
@@ -285,27 +284,12 @@ export function SettingsPage() {
                         type="number"
                         min={1}
                         max={MAX_ROUTING_ATTEMPTS}
-                        disabled={unlimited || inherit}
-                        value={unlimited || inherit || !Number.isFinite(field.value) ? "" : field.value}
-                        placeholder={inherit ? t("settings.routing.videoMaxAttemptsInherit") : t("settingsRoutingAttempts.unlimited")}
+                        disabled={unlimited}
+                        value={unlimited || !Number.isFinite(field.value) || field.value <= 0 ? "" : field.value}
+                        placeholder={t("settingsRoutingAttempts.unlimited")}
                         onBlur={field.onBlur}
                         onChange={(event) => field.onChange(event.currentTarget.valueAsNumber)}
                       />
-                      <div className="flex shrink-0 items-center gap-2">
-                        <span className="text-xs text-muted-foreground">{t("settings.routing.videoMaxAttemptsInherit")}</span>
-                        <Switch
-                          id="routing-video-max-attempts-inherit"
-                          aria-label={t("settings.routing.videoMaxAttemptsInherit")}
-                          checked={inherit}
-                          onCheckedChange={(checked) => {
-                            if (checked) {
-                              field.onChange(0);
-                              return;
-                            }
-                            field.onChange(form.getValues("routing.maxAttempts") > 0 ? form.getValues("routing.maxAttempts") : 3);
-                          }}
-                        />
-                      </div>
                       <div className="flex shrink-0 items-center gap-2">
                         <span className="text-xs text-muted-foreground">{t("settingsRoutingAttempts.unlimited")}</span>
                         <Switch
@@ -317,7 +301,7 @@ export function SettingsPage() {
                               field.onChange(UNLIMITED_ROUTING_ATTEMPTS);
                               return;
                             }
-                            field.onChange(form.getValues("routing.maxAttempts") > 0 ? form.getValues("routing.maxAttempts") : 3);
+                            field.onChange(limitedRoutingAttemptsRef.current > 0 ? limitedRoutingAttemptsRef.current : 999);
                           }}
                         />
                       </div>
