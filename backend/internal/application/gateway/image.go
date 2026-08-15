@@ -249,8 +249,11 @@ func (s *Service) executeImage(
 			body, _ := readRetryableBody(response.Body)
 			classified := newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
 			// Only treat explicit quota exhaustion as window depletion. Ordinary
-			// rate limits stay as short account cooldowns.
-			if classified.QuotaExhausted || classified.FreeQuotaExhausted || classified.ModelQuotaExhausted {
+			// rate limits stay as short account cooldowns. Console image/video free
+			// pools are authoritative windows: a 429 there means the local remaining
+			// counter is stale and the account must leave the rotation immediately.
+			explicitQuota := classified.QuotaExhausted || classified.FreeQuotaExhausted || classified.ModelQuotaExhausted
+			if explicitQuota || requiresAuthoritativeMediaQuota(lease.QuotaMode) {
 				exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
 				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
 				if reconcileErr != nil || !exhausted {

@@ -1032,15 +1032,15 @@ func TestSelectorConsumesOnlyMatchingQuotaSnapshot(t *testing.T) {
 		t.Fatalf("published snapshot was mutated: %#v", original[0].QuotaWindow)
 	}
 	consumed := selector.quotaConsumptionSnapshot(account.ProviderWeb)
-	if quotaWindowExhausted(values[0], consumed) {
+	if quotaWindowExhausted(values[0], consumed, "fast") {
 		t.Fatal("partially consumed quota was treated as exhausted")
 	}
 	selector.ConsumeQuota(account.ProviderWeb, 7, "other", 100)
-	if quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb)) {
+	if quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb), "fast") {
 		t.Fatal("a different quota mode affected the candidate")
 	}
 	selector.ConsumeQuota(account.ProviderWeb, 7, "fast", 7)
-	if !quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb)) {
+	if !quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb), "fast") {
 		t.Fatal("fully consumed quota remained schedulable")
 	}
 }
@@ -1436,3 +1436,86 @@ func (f failingConcurrencyLimiter) Acquire(context.Context, string, int) (func()
 func (f failingConcurrencyLimiter) Current(context.Context, string) (int, error) {
 	return 0, nil
 }
+
+func TestSelectorSkipsConsoleMediaAccountsWithoutAuthoritativeQuota(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-console-media-quota.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	create := func(name string) account.Credential {
+		value, _, createErr := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: name, SourceKey: name,
+			EncryptedAccessToken: name + "-token", Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		return value
+	}
+	missing := create("missing-video-window")
+	exhausted := create("exhausted-video-window")
+	available := create("available-video-window")
+	now := time.Now().UTC()
+	if err := accounts.SaveQuotaWindows(ctx, exhausted.ID, "", now, []account.QuotaWindow{
+		{AccountID: exhausted.ID, Mode: "console", Remaining: 10, Total: 10, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
+		{AccountID: exhausted.ID, Mode: "console_image", Remaining: 5, Total: 5, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
+		{AccountID: exhausted.ID, Mode: "console_video", Remaining: 0, Total: 2, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.SaveQuotaWindows(ctx, available.ID, "", now, []account.QuotaWindow{
+		{AccountID: available.ID, Mode: "console", Remaining: 10, Total: 10, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
+		{AccountID: available.ID, Mode: "console_image", Remaining: 5, Total: 5, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
+		{AccountID: available.ID, Mode: "console_video", Remaining: 2, Total: 2, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// missing deliberately has no console_video window; it must not enter the video pool.
+	if err := accounts.SaveQuotaWindows(ctx, missing.ID, "", now, []account.QuotaWindow{
+		{AccountID: missing.ID, Mode: "console", Remaining: 10, Total: 10, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
+		{AccountID: missing.ID, Mode: "console_image", Remaining: 5, Total: 5, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	lease, err := selector.Acquire(ctx, account.ProviderConsole, 0, "grok-imagine-video", "console_video", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != available.ID {
+		t.Fatalf("selected account = %d, want available account %d", lease.Credential.ID, available.ID)
+	}
+
+	// After excluding the only remaining-video account, selection must fail closed.
+	if _, err := selector.Acquire(ctx, account.ProviderConsole, 0, "grok-imagine-video", "console_video", "", map[uint64]bool{available.ID: true}, false); err == nil {
+		t.Fatal("expected no schedulable console video accounts after excluding remaining quota")
+	}
+}
+
+func TestQuotaWindowExhaustedRequiresAuthoritativeConsoleMedia(t *testing.T) {
+	missing := account.RoutingCandidate{Credential: account.Credential{ID: 1}}
+	if !quotaWindowExhausted(missing, nil, "console_video") {
+		t.Fatal("missing console_video window must be treated as exhausted")
+	}
+	defaulted := account.RoutingCandidate{Credential: account.Credential{ID: 2}, QuotaWindow: &account.QuotaWindow{AccountID: 2, Mode: "console_image", Remaining: 5, Total: 5, Source: account.QuotaSourceDefault}}
+	if !quotaWindowExhausted(defaulted, nil, "console_image") {
+		t.Fatal("default console_image window must not be schedulable")
+	}
+	available := account.RoutingCandidate{Credential: account.Credential{ID: 3}, QuotaWindow: &account.QuotaWindow{AccountID: 3, Mode: "console_video", Remaining: 1, Total: 2, Source: account.QuotaSourceUpstream}}
+	if quotaWindowExhausted(available, nil, "console_video") {
+		t.Fatal("upstream remaining console_video window was treated as exhausted")
+	}
+	// Non-media modes keep the legacy unknown-window fallback.
+	if quotaWindowExhausted(missing, nil, "console") {
+		t.Fatal("chat console mode without a window must stay schedulable")
+	}
+}
+

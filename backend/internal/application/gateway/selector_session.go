@@ -103,9 +103,9 @@ func (s *Selector) beginSelectionSessionForKey(ctx context.Context, provider acc
 			quotaCandidates++
 			continue
 		}
-		if quotaWindowExhausted(candidate, quotaConsumed) {
+		if quotaWindowExhausted(candidate, quotaConsumed, quotaMode) {
 			quotaCandidates++
-			if candidate.QuotaWindow.ResetAt != nil {
+			if candidate.QuotaWindow != nil && candidate.QuotaWindow.ResetAt != nil {
 				earliestRetry = earlierFuture(earliestRetry, *candidate.QuotaWindow.ResetAt, now)
 			}
 			continue

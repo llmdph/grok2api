@@ -266,7 +266,12 @@ func isPaidQuotaExhaustion(text string) bool {
 }
 
 func isFreeQuotaExhaustion(text string) bool {
-	return provider.ContainsAny(text, "subscription:free-usage-exhausted", "used all the included free usage for model")
+	return provider.ContainsAny(text,
+		"subscription:free-usage-exhausted",
+		"used all the included free usage for model",
+		"free usage quota exceeded",
+		"usage quota exceeded",
+	)
 }
 
 func isModelQuotaExhaustion(text string) bool {

@@ -497,9 +497,9 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			quotaCandidates++
 			continue
 		}
-		if quotaWindowExhausted(candidate, quotaConsumed) {
+		if quotaWindowExhausted(candidate, quotaConsumed, quotaMode) {
 			quotaCandidates++
-			if candidate.QuotaWindow.ResetAt != nil {
+			if candidate.QuotaWindow != nil && candidate.QuotaWindow.ResetAt != nil {
 				earliestRetry = earlierFuture(earliestRetry, *candidate.QuotaWindow.ResetAt, now)
 			}
 			continue
@@ -799,9 +799,9 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 			if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
 				return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted}
 			}
-			if quotaWindowExhausted(candidate, quotaConsumed) {
+			if quotaWindowExhausted(candidate, quotaConsumed, quotaMode) {
 				var retryAfter time.Duration
-				if candidate.QuotaWindow.ResetAt != nil {
+				if candidate.QuotaWindow != nil && candidate.QuotaWindow.ResetAt != nil {
 					retryAfter = retryDelay(now, *candidate.QuotaWindow.ResetAt)
 				}
 				return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted, RetryAfter: retryAfter}
@@ -1021,12 +1021,29 @@ func (s *Selector) quotaConsumptionSnapshot(provider account.Provider) map[accou
 	return result
 }
 
-func quotaWindowExhausted(candidate account.RoutingCandidate, consumed map[accountQuotaConsumptionKey]int) bool {
+func quotaWindowExhausted(candidate account.RoutingCandidate, consumed map[accountQuotaConsumptionKey]int, quotaMode string) bool {
+	// Console image/video free pools only schedule accounts with an upstream-confirmed
+	// remaining window. Missing or synthetic windows used to look "available" and burned
+	// attempt budget on accounts that immediately 429 with free usage quota exceeded.
+	if requiresAuthoritativeMediaQuota(quotaMode) {
+		if candidate.QuotaWindow == nil || candidate.QuotaWindow.Source != account.QuotaSourceUpstream {
+			return true
+		}
+	}
 	if candidate.QuotaWindow == nil {
 		return false
 	}
 	remaining := candidate.QuotaWindow.Remaining - consumed[accountQuotaConsumptionKey{accountID: candidate.Credential.ID, mode: candidate.QuotaWindow.Mode}]
 	return remaining <= 0
+}
+
+func requiresAuthoritativeMediaQuota(mode string) bool {
+	switch strings.TrimSpace(mode) {
+	case "console_image", "console_video":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Selector) clearQuotaConsumption(provider account.Provider) {

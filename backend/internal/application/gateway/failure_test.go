@@ -381,3 +381,12 @@ func TestTerminalRequestForbiddenRequiresExplicitRequestSignal(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPUpstreamFailureClassifiesConsoleFreeUsageQuotaExceeded(t *testing.T) {
+	body := `Console 媒体上游返回 429: Free usage quota exceeded. Purchase credits or provision an API key at https://console.x.ai`
+	failure := newHTTPUpstreamFailure(http.StatusTooManyRequests, []byte(body), 7, "console")
+	if !failure.AccountScoped || !failure.FreeQuotaExhausted || !failure.QuotaExhausted {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
+
