@@ -30,6 +30,29 @@ type HTTPStatusError interface {
 	HTTPStatusCode() int
 }
 
+// RetryAfterError preserves a safe upstream retry delay when an adapter cannot
+// return a Response, for example when a WebSocket handshake is rejected.
+type RetryAfterError interface {
+	error
+	RetryAfterDuration() time.Duration
+}
+
+// RequestScopedError marks an upstream rejection that retrying with another
+// account or egress cannot resolve.
+type RequestScopedError interface {
+	error
+	RequestScopedFailure() bool
+}
+
+// PublicMessageError exposes a deliberately sanitized message that may cross
+// the public API boundary. Provider errors must opt in; arbitrary Error()
+// strings can contain upstream response bodies, tokens, cookies, or request
+// diagnostics and therefore are never returned to clients by default.
+type PublicMessageError interface {
+	error
+	PublicErrorMessage() string
+}
+
 // ErrorHTTPStatus extracts the upstream HTTP status from a Provider error chain.
 func ErrorHTTPStatus(err error) (int, bool) {
 	var statusError HTTPStatusError
@@ -44,12 +67,23 @@ func ErrorHTTPStatus(err error) (int, bool) {
 type VideoStage string
 
 const (
+	// VideoStagePrepare is local work performed before the create request is sent.
+	// It is not account-failover eligible because retrying deterministic local
+	// validation or configuration failures against another credential is useless.
+	VideoStagePrepare VideoStage = "prepare"
+	// VideoStageCreate means the upstream explicitly rejected the create request.
+	// Account failover is safe only for the retryable 4xx statuses selected by
+	// the gateway; 5xx responses remain indeterminate because work may already
+	// have been accepted before the server failed.
 	VideoStageCreate VideoStage = "create"
-	VideoStagePoll   VideoStage = "poll"
+	// VideoStageSubmitted means the create request may have reached upstream but
+	// no usable job identifier was obtained. Retrying could duplicate work.
+	VideoStageSubmitted VideoStage = "submitted"
+	VideoStagePoll      VideoStage = "poll"
 )
 
-// VideoStageError marks whether a video failure happened before the upstream
-// job was created (safe to switch accounts) or while polling an existing job.
+// VideoStageError records the asynchronous video phase without treating every
+// create-path error as safe for account failover.
 type VideoStageError struct {
 	Stage  VideoStage
 	Status int
@@ -104,6 +138,20 @@ func VideoErrorStage(err error) (VideoStage, bool) {
 	return stageErr.Stage, true
 }
 
+// VideoCreateFailureStage distinguishes an explicit upstream rejection from an
+// indeterminate POST result. Explicit 4xx responses (including the 401
+// sentinel) are rejections; transport errors and 5xx responses remain
+// submitted because the upstream may already have accepted the job.
+func VideoCreateFailureStage(err error) VideoStage {
+	if errors.Is(err, ErrUnauthorized) {
+		return VideoStageCreate
+	}
+	if status, ok := ErrorHTTPStatus(err); ok && status >= http.StatusBadRequest && status < http.StatusInternalServerError {
+		return VideoStageCreate
+	}
+	return VideoStageSubmitted
+}
+
 // WrapVideoStage annotates err with the video phase and optional HTTP status.
 func WrapVideoStage(stage VideoStage, status int, err error) error {
 	if err == nil {
@@ -117,6 +165,33 @@ func WrapVideoStage(stage VideoStage, status int, err error) error {
 		status = ErrorHTTPStatusOrZero(err)
 	}
 	return &VideoStageError{Stage: stage, Status: status, Err: err}
+}
+
+// ErrorRetryAfter extracts a positive retry delay from an error chain.
+func ErrorRetryAfter(err error) time.Duration {
+	var retryError RetryAfterError
+	if !errors.As(err, &retryError) {
+		return 0
+	}
+	return max(0, retryError.RetryAfterDuration())
+}
+
+// IsRequestScopedError reports whether the Provider has positively classified
+// the failure as request-scoped.
+func IsRequestScopedError(err error) bool {
+	var requestError RequestScopedError
+	return errors.As(err, &requestError) && requestError.RequestScopedFailure()
+}
+
+// ErrorPublicMessage extracts a message that the Provider has explicitly
+// classified as safe for clients.
+func ErrorPublicMessage(err error) (string, bool) {
+	var publicError PublicMessageError
+	if !errors.As(err, &publicError) {
+		return "", false
+	}
+	message := strings.TrimSpace(publicError.PublicErrorMessage())
+	return message, message != ""
 }
 
 // MediaPostProcessingStage identifies a local processing stage that failed after media generation.
@@ -319,6 +394,17 @@ type QuotaSnapshot struct {
 	SyncedAt time.Time
 }
 
+// QuotaGroupSnapshot is an authoritative snapshot for a group of quota modes
+// returned by one upstream request. Modes lists the complete local scope so
+// callers can atomically remove products that the upstream explicitly reports
+// as unavailable without touching unrelated quota windows.
+type QuotaGroupSnapshot struct {
+	Group    string
+	Modes    []string
+	Windows  []account.QuotaWindow
+	SyncedAt time.Time
+}
+
 type ImageGenerationRequest struct {
 	Credential     account.Credential
 	Model          string
@@ -327,6 +413,7 @@ type ImageGenerationRequest struct {
 	Size           string
 	AspectRatio    string
 	Resolution     string
+	Quality        string
 	ResponseFormat string
 	Streaming      bool
 	PartialImages  int
@@ -347,18 +434,29 @@ type ImageEditRequest struct {
 	Size           string
 	AspectRatio    string
 	Resolution     string
+	Quality        string
 	ResponseFormat string
 	Streaming      bool
 	PartialImages  int
 }
 
 // VideoOperation selects the official xAI video endpoint family.
-type VideoOperation string
+type VideoOperation = media.VideoOperation
 
 const (
-	VideoOperationGenerate VideoOperation = "generate"
-	VideoOperationEdit     VideoOperation = "edit"
-	VideoOperationExtend   VideoOperation = "extend"
+	VideoOperationGenerate = media.VideoOperationGenerate
+	VideoOperationEdit     = media.VideoOperationEdit
+	VideoOperationExtend   = media.VideoOperationExtend
+)
+
+// ConsoleVideoMaxReferenceImages and ConsoleVideoMaxReferenceDurationSeconds
+// describe the Console reference-to-video contract enforced by the upstream.
+// They are shared by admission control and the Console adapter so invalid
+// asynchronous jobs are rejected before enqueueing without weakening the
+// adapter's final request-boundary validation.
+const (
+	ConsoleVideoMaxReferenceImages          = 7
+	ConsoleVideoMaxReferenceDurationSeconds = 10
 )
 
 type VideoRequest struct {
@@ -370,11 +468,11 @@ type VideoRequest struct {
 	// Model is the selected upstream video model when the Provider supports more than one.
 	Model string
 	// Operation defaults to generate when empty.
-	Operation VideoOperation
-	Prompt        string
-	Duration      int
-	AspectRatio   string
-	Resolution    string
+	Operation   VideoOperation
+	Prompt      string
+	Duration    int
+	AspectRatio string
+	Resolution  string
 	// ImageURL is the optional first-frame image (official "image" field).
 	ImageURL string
 	// ReferenceURLs are style/content references (official "reference_images").
@@ -386,7 +484,7 @@ type VideoRequest struct {
 	ReferenceAudios []string
 	// VideoURL is required for edit/extend (official "video" field).
 	VideoURL string
-	Progress      func(int)
+	Progress func(int)
 }
 
 type VideoResult struct {
@@ -403,16 +501,16 @@ type TTSOutputFormat struct {
 }
 
 type TTSRequest struct {
-	Credential                account.Credential
-	Model                     string
-	Text                      string
-	VoiceID                   string
-	Language                  string
-	OutputFormat              TTSOutputFormat
-	Speed                     float64
-	OptimizeStreamingLatency  int
-	TextNormalization         bool
-	WithTimestamps            bool
+	Credential               account.Credential
+	Model                    string
+	Text                     string
+	VoiceID                  string
+	Language                 string
+	OutputFormat             TTSOutputFormat
+	Speed                    float64
+	OptimizeStreamingLatency int
+	TextNormalization        bool
+	WithTimestamps           bool
 }
 
 type TTSTimestampSpan struct {
@@ -631,6 +729,20 @@ type QuotaAdapter interface {
 	SyncQuotaMode(ctx context.Context, credential account.Credential, mode string) (account.QuotaWindow, error)
 }
 
+// QuotaGroupAdapter is optional. It is used when one upstream endpoint returns
+// several related quota products as one authoritative response.
+type QuotaGroupAdapter interface {
+	Adapter
+	SyncQuotaGroup(ctx context.Context, credential account.Credential, group string) (QuotaGroupSnapshot, error)
+}
+
+// QuotaRefreshMetadataAdapter maps a model to an internal refresh group. The
+// group is scheduling metadata, not a routable quota mode.
+type QuotaRefreshMetadataAdapter interface {
+	Adapter
+	QuotaRefreshGroup(upstreamModel string) string
+}
+
 // WebAccountSettingsAdapter defines upstream profile-setting capabilities for Grok Web SSO accounts.
 // This capability belongs only to the Web Provider; Build and Console must not emulate it through generic account logic.
 type WebAccountSettingsAdapter interface {
@@ -695,6 +807,7 @@ type RealtimeVoiceAdapter interface {
 type VoiceWebSocketConn interface {
 	ReadMessage() (messageType int, data []byte, err error)
 	WriteMessage(messageType int, data []byte) error
+	SetReadLimit(limit int64)
 	Close() error
 }
 
@@ -734,6 +847,13 @@ type RoutingMetadataAdapter interface {
 	Adapter
 	QuotaMode(upstreamModel string) string
 	TierOrder(upstreamModel string) []account.WebTier
+}
+
+// QuotaTierOrderAdapter optionally narrows account tiers for a concrete quota
+// product. It is used when one public model exposes parameter variants backed
+// by different upstream entitlements.
+type QuotaTierOrderAdapter interface {
+	TierOrderForQuotaMode(upstreamModel, quotaMode string) []account.WebTier
 }
 
 // ModelAlias resolves a hidden compatibility model name to one public route and can fix reasoning effort.
@@ -1078,6 +1198,15 @@ func (r *Registry) Quota(value account.Provider) (QuotaAdapter, bool) {
 	return result, ok
 }
 
+func (r *Registry) QuotaGroup(value account.Provider) (QuotaGroupAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(QuotaGroupAdapter)
+	return result, ok
+}
+
 // WebAccountSettings returns the Grok Web-specific account profile settings capability.
 func (r *Registry) WebAccountSettings() (WebAccountSettingsAdapter, bool) {
 	adapter, ok := r.Get(account.ProviderWeb)
@@ -1100,10 +1229,37 @@ func (r *Registry) QuotaMode(value account.Provider, upstreamModel string) strin
 	return metadata.QuotaMode(upstreamModel)
 }
 
+func (r *Registry) QuotaRefreshGroup(value account.Provider, upstreamModel string) string {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return ""
+	}
+	metadata, ok := adapter.(QuotaRefreshMetadataAdapter)
+	if !ok {
+		return ""
+	}
+	return metadata.QuotaRefreshGroup(upstreamModel)
+}
+
 func (r *Registry) TierOrder(value account.Provider, upstreamModel string) []account.WebTier {
 	adapter, ok := r.Get(value)
 	if !ok {
 		return nil
+	}
+	metadata, ok := adapter.(RoutingMetadataAdapter)
+	if !ok {
+		return nil
+	}
+	return metadata.TierOrder(upstreamModel)
+}
+
+func (r *Registry) TierOrderForQuotaMode(value account.Provider, upstreamModel, quotaMode string) []account.WebTier {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil
+	}
+	if metadata, ok := adapter.(QuotaTierOrderAdapter); ok {
+		return metadata.TierOrderForQuotaMode(upstreamModel, quotaMode)
 	}
 	metadata, ok := adapter.(RoutingMetadataAdapter)
 	if !ok {

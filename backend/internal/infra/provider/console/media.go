@@ -29,15 +29,29 @@ const (
 	consoleMediaOutputAttempts  = 3
 	consoleVideoPollEvery       = 2 * time.Second
 	consoleMaxEditImages        = 3
-	// Align with the gateway ceiling and official xAI video inputs:
-	// image = first frame; reference_images = style/content references (may be length 1).
-	consoleMaxVideoImages = mediadomain.MaxInputImages
+	// Upstream enforces the two video image inputs separately (measured against
+	// console.x.ai on both grok-imagine-video and grok-imagine-video-1.5):
+	//   image            = first frame, image-to-video, at most 1
+	//   reference_images = style/content references, reference-to-video, at most 7
+	//     8 references answer 400 "Too many reference images: 8. Maximum allowed is 7."
+	// The two are mutually exclusive below and their limits are never summed, so a
+	// combined ceiling would accept payloads that upstream then rejects.
+	consoleMaxVideoFirstFrames = 1
 )
 
 type consoleMediaUpstreamError struct {
-	status  int
-	summary string
+	status        int
+	summary       string
+	retryAfter    time.Duration
+	requestScoped bool
 }
+
+var (
+	_ provider.HTTPStatusError    = (*consoleMediaUpstreamError)(nil)
+	_ provider.RetryAfterError    = (*consoleMediaUpstreamError)(nil)
+	_ provider.RequestScopedError = (*consoleMediaUpstreamError)(nil)
+	_ provider.PublicMessageError = (*consoleMediaUpstreamError)(nil)
+)
 
 func (e *consoleMediaUpstreamError) Error() string {
 	if e == nil {
@@ -51,6 +65,24 @@ func (e *consoleMediaUpstreamError) HTTPStatusCode() int {
 		return 0
 	}
 	return e.status
+}
+
+func (e *consoleMediaUpstreamError) RetryAfterDuration() time.Duration {
+	if e == nil {
+		return 0
+	}
+	return e.retryAfter
+}
+
+func (e *consoleMediaUpstreamError) RequestScopedFailure() bool {
+	return e != nil && e.requestScoped
+}
+
+func (e *consoleMediaUpstreamError) PublicErrorMessage() string {
+	if e == nil {
+		return ""
+	}
+	return e.summary
 }
 
 func (a *Adapter) GenerateImage(ctx context.Context, request provider.ImageGenerationRequest) (*provider.Response, error) {
@@ -79,12 +111,19 @@ func (a *Adapter) GenerateImage(ctx context.Context, request provider.ImageGener
 	if err != nil {
 		return invalidConsoleMediaRequest(err.Error()), nil
 	}
+	quality, err := normalizeConsoleImageQuality(request.Model, request.Quality)
+	if err != nil {
+		return invalidConsoleMediaRequest(err.Error()), nil
+	}
 	payload := map[string]any{"model": request.Model, "prompt": request.Prompt, "n": count, "response_format": format}
 	if ratio != "" {
 		payload["aspect_ratio"] = ratio
 	}
 	if resolution != "" {
 		payload["resolution"] = resolution
+	}
+	if quality != "" {
+		payload["quality"] = quality
 	}
 	return a.forwardConsoleMedia(ctx, request.Credential, "/images/generations", payload, format, count)
 }
@@ -118,6 +157,10 @@ func (a *Adapter) EditImage(ctx context.Context, request provider.ImageEditReque
 	if err != nil {
 		return invalidConsoleMediaRequest(err.Error()), nil
 	}
+	quality, err := normalizeConsoleImageQuality(request.Model, request.Quality)
+	if err != nil {
+		return invalidConsoleMediaRequest(err.Error()), nil
+	}
 	images := make([]map[string]any, 0, len(request.ImageURLs))
 	for _, rawURL := range request.ImageURLs {
 		value := strings.TrimSpace(rawURL)
@@ -137,6 +180,9 @@ func (a *Adapter) EditImage(ctx context.Context, request provider.ImageEditReque
 	}
 	if resolution != "" {
 		payload["resolution"] = resolution
+	}
+	if quality != "" {
+		payload["quality"] = quality
 	}
 	return a.forwardConsoleMedia(ctx, request.Credential, "/images/edits", payload, format, count)
 }
@@ -417,13 +463,24 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if operation != provider.VideoOperationGenerate && modelName != "grok-imagine-video" {
 		return provider.VideoResult{}, fmt.Errorf("%s 仅支持 grok-imagine-video", operation)
 	}
-	totalImages := consoleVideoImageCount(request)
-	if totalImages > consoleMaxVideoImages {
-		return provider.VideoResult{}, fmt.Errorf("Console %s 最多支持 %d 张输入图，当前为 %d 张", modelName, consoleMaxVideoImages, totalImages)
+	firstFrames, referenceImages := consoleVideoImageCounts(request)
+	if firstFrames > consoleMaxVideoFirstFrames {
+		return provider.VideoResult{}, fmt.Errorf("Console %s 最多支持 %d 张首帧图，当前为 %d 张", modelName, consoleMaxVideoFirstFrames, firstFrames)
+	}
+	if referenceImages > provider.ConsoleVideoMaxReferenceImages {
+		return provider.VideoResult{}, fmt.Errorf("Console %s 最多支持 %d 张参考图，当前为 %d 张", modelName, provider.ConsoleVideoMaxReferenceImages, referenceImages)
 	}
 	if operation == provider.VideoOperationGenerate {
 		if request.Duration < 1 || request.Duration > 15 {
 			return provider.VideoResult{}, errors.New("duration 必须在 1 到 15 秒之间")
+		}
+		// reference-to-video on the base model caps at 10s upstream; measured:
+		//   grok-imagine-video + reference_images + duration=15
+		//   -> 400 "Duration 15s exceeds the maximum allowed for reference-to-video, which is 10s."
+		// image-to-video (the image field) and grok-imagine-video-1.5 both keep 15s,
+		// so the cap keys on reference_images plus the base model, not on duration alone.
+		if modelName == "grok-imagine-video" && referenceImages > 0 && request.Duration > provider.ConsoleVideoMaxReferenceDurationSeconds {
+			return provider.VideoResult{}, fmt.Errorf("%s 的参考图生视频最长 %d 秒，当前为 %d 秒", modelName, provider.ConsoleVideoMaxReferenceDurationSeconds, request.Duration)
 		}
 	} else if operation == provider.VideoOperationExtend {
 		// Official /v1/videos/extensions defaults to 6s and accepts 2-10s.
@@ -436,8 +493,15 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	} else if request.Duration != 0 {
 		return provider.VideoResult{}, errors.New("视频编辑不支持 duration")
 	}
-	if err := validateConsoleVideoResolution(modelName, request.Resolution); err != nil {
-		return provider.VideoResult{}, err
+	if request.Resolution == "1080p" {
+		if modelName != "grok-imagine-video-1.5" {
+			return provider.VideoResult{}, fmt.Errorf("%s 不支持 1080p", modelName)
+		}
+		if len(request.ReferenceURLs) > 0 {
+			return provider.VideoResult{}, errors.New("reference_images 模式最高支持 720p")
+		}
+	} else if request.Resolution != "" && request.Resolution != "480p" && request.Resolution != "720p" {
+		return provider.VideoResult{}, fmt.Errorf("%s 仅支持 480p、720p 或 1080p", modelName)
 	}
 	payload := map[string]any{"model": modelName}
 	if operation == provider.VideoOperationGenerate || operation == provider.VideoOperationExtend {
@@ -546,11 +610,11 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	}
 	created, err := a.doConsoleVideoJSON(ctx, request.Credential, token, lease, http.MethodPost, consoleV1Endpoint(baseURL, createPath), body)
 	if err != nil {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStageCreate, 0, err)
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
 	}
 	requestID, err := parseConsoleVideoCreate(created)
 	if err != nil {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStageCreate, 0, err)
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStageSubmitted, 0, err)
 	}
 	if request.Progress != nil {
 		request.Progress(1)
@@ -608,7 +672,7 @@ func (a *Adapter) doConsoleVideoJSON(ctx context.Context, credential account.Cre
 		if !dpopRequired {
 			a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, response.StatusCode, nil)
 		}
-		return nil, newConsoleMediaUpstreamError(response.StatusCode, data)
+		return nil, newConsoleMediaUpstreamError(response.StatusCode, data, parseConsoleRetryAfterHeader(response.Header.Get("Retry-After"), time.Now().UTC()))
 	}
 	a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, response.StatusCode, nil)
 	return data, nil
@@ -702,6 +766,20 @@ func normalizeConsoleImageResolution(value string) (string, error) {
 	return value, nil
 }
 
+func normalizeConsoleImageQuality(model, value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(model) != "grok-imagine-image-2.0" {
+		return "", errors.New("quality 仅支持 grok-imagine-image-2.0")
+	}
+	if value != "low" && value != "medium" {
+		return "", errors.New("quality 必须是 low 或 medium")
+	}
+	return value, nil
+}
+
 func resolveConsoleImageAspectRatio(aspectRatio, size string) (string, error) {
 	value := strings.ToLower(strings.TrimSpace(aspectRatio))
 	if value == "" {
@@ -776,29 +854,7 @@ func parseConsoleVideoStatus(body []byte, progress func(int)) (provider.VideoRes
 	}
 }
 
-
-func validateConsoleVideoResolution(modelName, resolution string) error {
-	resolution = strings.TrimSpace(resolution)
-	if resolution == "" {
-		return nil
-	}
-	switch resolution {
-	case "480p", "720p":
-		return nil
-	case "1080p":
-		if strings.TrimSpace(modelName) == "grok-imagine-video-1.5" {
-			return nil
-		}
-		return fmt.Errorf("%s 仅支持 480p 或 720p", modelName)
-	default:
-		if strings.TrimSpace(modelName) == "grok-imagine-video-1.5" {
-			return fmt.Errorf("%s 仅支持 480p、720p 或 1080p", modelName)
-		}
-		return fmt.Errorf("%s 仅支持 480p 或 720p", modelName)
-	}
-}
-
-func newConsoleMediaUpstreamError(status int, body []byte) error {
+func newConsoleMediaUpstreamError(status int, body []byte, retryAfter time.Duration) error {
 	message := ""
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) == nil {
@@ -806,22 +862,38 @@ func newConsoleMediaUpstreamError(status int, body []byte) error {
 		if message == "" {
 			message = safeConsoleMediaErrorValue(payload["message"])
 		}
+		if message == "" {
+			message = safeConsoleMediaErrorValue(payload["detail"])
+		}
 	}
 	summary := fmt.Sprintf("Console 媒体上游返回 %d", status)
 	if message != "" {
 		summary += ": " + message
 	}
-	return &consoleMediaUpstreamError{status: status, summary: summary}
+	if retryAfter <= 0 {
+		retryAfter = consoleRetryAfter(body)
+	}
+	return &consoleMediaUpstreamError{
+		status: status, summary: summary, retryAfter: retryAfter,
+		requestScoped: status == http.StatusForbidden && provider.IsDPoPProofRequiredBody(body),
+	}
 }
 
 func safeConsoleMediaErrorValue(value any) string {
 	if object, ok := value.(map[string]any); ok {
-		for _, key := range []string{"message", "code", "type"} {
+		for _, key := range []string{"message", "msg", "code", "type", "detail", "error_description"} {
 			raw, exists := object[key]
 			if !exists || raw == nil {
 				continue
 			}
-			if text := safeConsoleMediaText(fmt.Sprint(raw)); text != "" {
+			if text := safeConsoleMediaErrorValue(raw); text != "" {
+				return text
+			}
+		}
+	}
+	if values, ok := value.([]any); ok {
+		for _, item := range values {
+			if text := safeConsoleMediaErrorValue(item); text != "" {
 				return text
 			}
 		}
@@ -829,13 +901,24 @@ func safeConsoleMediaErrorValue(value any) string {
 	if text, ok := value.(string); ok {
 		return safeConsoleMediaText(text)
 	}
+	switch value.(type) {
+	case json.Number, float64, float32, int, int64, int32, uint, uint64, uint32, bool:
+		return safeConsoleMediaText(fmt.Sprint(value))
+	}
 	return ""
 }
 
 func safeConsoleMediaText(value string) string {
 	value = strings.Join(strings.Fields(value), " ")
-	if strings.Contains(strings.ToLower(value), "authorization") || strings.Contains(strings.ToLower(value), "cookie") {
-		return "上游拒绝请求"
+	lower := strings.ToLower(value)
+	for _, sensitive := range []string{
+		"authorization", "cookie", "bearer ",
+		"access_token", "access-token", "refresh_token", "refresh-token",
+		"api_key", "api-key", "sso-rw", "cf_clearance",
+	} {
+		if strings.Contains(lower, sensitive) {
+			return "上游拒绝请求"
+		}
 	}
 	const limit = 160
 	if len(value) <= limit {
@@ -853,15 +936,14 @@ func trustedConsoleVideoHost(host string) bool {
 	return host == "vidgen.x.ai" || strings.HasSuffix(host, ".vidgen.x.ai")
 }
 
-func consoleVideoImageCount(request provider.VideoRequest) int {
-	count := 0
+func consoleVideoImageCounts(request provider.VideoRequest) (firstFrames int, referenceImages int) {
 	if strings.TrimSpace(request.ImageURL) != "" {
-		count++
+		firstFrames++
 	}
 	for _, raw := range request.ReferenceURLs {
 		if strings.TrimSpace(raw) != "" {
-			count++
+			referenceImages++
 		}
 	}
-	return count
+	return firstFrames, referenceImages
 }

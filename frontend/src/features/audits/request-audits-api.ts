@@ -31,6 +31,7 @@ export type AuditDTO = {
   modelRouteId: string;
   modelPublicId?: string;
   modelUpstreamModel?: string;
+  reasoningEffort?: string;
   provider: "grok_build" | "grok_web" | "grok_console";
   operation: "responses" | "compaction" | "chat" | "messages" | "image" | "image_edit" | "video" | "tts" | "stt" | "realtime" | "voice";
   usageSource: "upstream" | "estimated" | "none";
@@ -140,7 +141,7 @@ const auditBillingValidator = hasShape({
 });
 const auditValidator = hasShape({
   id: isString, requestId: isString, clientKeyId: isString, clientKeyName: isOptional(isString), modelRouteId: isString,
-  modelPublicId: isOptional(isString), modelUpstreamModel: isOptional(isString), provider: isOneOf("grok_build", "grok_web", "grok_console"),
+  modelPublicId: isOptional(isString), modelUpstreamModel: isOptional(isString), reasoningEffort: isOptional(isString), provider: isOneOf("grok_build", "grok_web", "grok_console"),
   operation: isOneOf("responses", "compaction", "chat", "messages", "image", "image_edit", "video", "tts", "stt", "realtime", "voice"), usageSource: isOneOf("upstream", "estimated", "none"),
   accountId: isOptional(isString), accountName: isOptional(isString),
   egressNodeId: isOptional(isString), egressNodeName: isOptional(isString),

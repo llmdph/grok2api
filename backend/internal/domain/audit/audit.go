@@ -79,6 +79,7 @@ type Record struct {
 	ModelRouteID            uint64
 	ModelPublicID           string
 	ModelUpstreamModel      string
+	ReasoningEffort         string
 	Provider                string
 	Operation               Operation
 	UsageSource             UsageSource

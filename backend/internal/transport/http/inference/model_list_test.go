@@ -69,6 +69,24 @@ func TestAppendReasoningModelAliasesUsesRealSupportedLevels(t *testing.T) {
 	}
 }
 
+func TestAppendReasoningModelAliasesIncludesConsoleGrok46XHigh(t *testing.T) {
+	expanded := appendReasoningModelAliases([]modelListItem{{
+		ID: "grok-4.6", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityResponses,
+	}})
+	ids := make(map[string]bool, len(expanded))
+	for _, item := range expanded {
+		ids[item.ID] = true
+	}
+	for _, want := range []string{"grok-4.6-low", "grok-4.6-medium", "grok-4.6-high", "grok-4.6-xhigh"} {
+		if !ids[want] {
+			t.Fatalf("missing Console alias %q in %#v", want, expanded)
+		}
+	}
+	if ids["grok-4.6-max"] {
+		t.Fatalf("client compatibility value max must not be advertised as a model alias: %#v", expanded)
+	}
+}
+
 func TestNewCodexModelCatalogIncludesRequiredProtocolFields(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	items := newModelListItems([]modeldomain.Route{
@@ -107,6 +125,42 @@ func TestNewCodexModelCatalogIncludesRequiredProtocolFields(t *testing.T) {
 	var envelope map[string]json.RawMessage
 	if err = json.Unmarshal(body, &envelope); err != nil || len(envelope) != 1 || envelope["models"] == nil {
 		t.Fatalf("catalog envelope = %s, err = %v", body, err)
+	}
+}
+
+func TestCodexCatalogUsesGrok46MetadataForBaseAndXHighAlias(t *testing.T) {
+	items := []modelListItem{
+		{ID: "grok-4.6", Provider: account.ProviderBuild, Capability: modeldomain.CapabilityResponses},
+		{ID: "grok-4.6-xhigh", Provider: account.ProviderBuild, Capability: modeldomain.CapabilityResponses},
+	}
+	models := newCodexModelCatalog(items).Models
+	if len(models) != 2 {
+		t.Fatalf("model count = %d, want 2", len(models))
+	}
+
+	base := models[0]
+	if base.ContextWindow != 500000 || base.MaxContextWindow != 500000 {
+		t.Fatalf("grok-4.6 context window = %d/%d, want 500000/500000", base.ContextWindow, base.MaxContextWindow)
+	}
+	if base.Description != "xAI Grok 4.6 frontier model with reasoning and vision." {
+		t.Fatalf("grok-4.6 description = %q", base.Description)
+	}
+	if len(base.InputModalities) != 2 || base.InputModalities[0] != "text" || base.InputModalities[1] != "image" {
+		t.Fatalf("grok-4.6 input modalities = %#v, want text/image", base.InputModalities)
+	}
+	if base.DefaultReasoningLevel != "medium" || len(base.SupportedReasoningLevels) != 4 || base.SupportedReasoningLevels[3].Effort != "xhigh" {
+		t.Fatalf("grok-4.6 reasoning metadata = default %q, levels %#v", base.DefaultReasoningLevel, base.SupportedReasoningLevels)
+	}
+	if !base.SupportsReasoningSummaryParameter || !base.SupportsReasoningSummaries {
+		t.Fatalf("grok-4.6 reasoning support missing: %#v", base)
+	}
+
+	alias := models[1]
+	if alias.ContextWindow != base.ContextWindow || alias.MaxContextWindow != base.MaxContextWindow || alias.Description != base.Description {
+		t.Fatalf("grok-4.6-xhigh did not inherit base metadata: %#v", alias)
+	}
+	if len(alias.InputModalities) != 2 || alias.DefaultReasoningLevel != "xhigh" || len(alias.SupportedReasoningLevels) != 1 || alias.SupportedReasoningLevels[0].Effort != "xhigh" {
+		t.Fatalf("grok-4.6-xhigh metadata = %#v", alias)
 	}
 }
 

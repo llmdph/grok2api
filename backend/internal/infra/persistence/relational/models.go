@@ -296,6 +296,7 @@ type requestAuditModel struct {
 	ModelRouteID            uint64    `gorm:"not null;check:chk_request_audits_model_route_id,model_route_id > 0"`
 	ModelPublicID           string    `gorm:"size:255;check:chk_request_audits_model_public_id,length(model_public_id) <= 255"`
 	ModelUpstreamModel      string    `gorm:"size:255;check:chk_request_audits_model_upstream_model,length(model_upstream_model) <= 255"`
+	ReasoningEffort         string    `gorm:"size:32;not null;default:'';check:chk_request_audits_reasoning_effort,length(reasoning_effort) <= 32"`
 	Provider                string    `gorm:"size:32;not null;check:chk_request_audits_provider,provider IN ('grok_build','grok_web','grok_console')"`
 	Operation               string    `gorm:"size:32;not null;check:chk_request_audits_operation,operation IN ('responses','compaction','chat','messages','image','image_edit','video','tts','stt','realtime','voice')"`
 	UsageSource             string    `gorm:"size:16;not null;check:chk_request_audits_usage_source,usage_source IN ('upstream','estimated','none')"`
@@ -404,10 +405,11 @@ type mediaJobModel struct {
 	Model          string  `gorm:"size:255;not null;check:chk_media_jobs_model,length(trim(model)) BETWEEN 1 AND 255"`
 	ModelRouteID   uint64  `gorm:"not null;check:chk_media_jobs_model_route_id,model_route_id > 0"`
 	UpstreamModel  string  `gorm:"size:255;not null;check:chk_media_jobs_upstream_model,length(trim(upstream_model)) BETWEEN 1 AND 255"`
+	Operation      string  `gorm:"size:16;not null;default:'generate';check:chk_media_jobs_operation,operation IN ('generate','edit','extend')"`
 	Prompt         string  `gorm:"type:text;not null;check:chk_media_jobs_prompt,length(prompt) BETWEEN 0 AND 100000"`
-	Seconds        int     `gorm:"not null;check:chk_media_jobs_seconds,seconds BETWEEN 1 AND 15"`
-	Size           string  `gorm:"size:32;not null;check:chk_media_jobs_size,length(trim(size)) BETWEEN 1 AND 32"`
-	Quality        string  `gorm:"size:32;not null;check:chk_media_jobs_quality,length(trim(quality)) BETWEEN 1 AND 32"`
+	Seconds        int     `gorm:"not null;check:chk_media_jobs_seconds,seconds BETWEEN 0 AND 15"`
+	Size           string  `gorm:"size:32;not null;default:'';check:chk_media_jobs_size,length(trim(size)) BETWEEN 0 AND 32"`
+	Quality        string  `gorm:"size:32;not null;default:'';check:chk_media_jobs_quality,length(trim(quality)) BETWEEN 0 AND 32"`
 	Status         string  `gorm:"size:32;not null;check:chk_media_jobs_status,status IN ('queued','in_progress','completed','failed')"`
 	Progress       int     `gorm:"not null;check:chk_media_jobs_progress,progress BETWEEN 0 AND 100"`
 	// InputJSON limit 33554432 must stay equal to media.MaxInputJSONBytes (GORM tags require literals).
@@ -477,6 +479,7 @@ type egressSubscriptionSourceModel struct {
 	Scope                  string `gorm:"size:32;not null;check:chk_egress_subscription_sources_scope,scope IN ('grok_build','grok_web','grok_console','grok_web_asset','grok_console_asset')"`
 	Enabled                bool   `gorm:"not null;default:true"`
 	EncryptedURL           string `gorm:"type:text;not null;default:'';check:chk_egress_subscription_sources_url,length(encrypted_url) <= 65536"`
+	EncryptedProxyURL      string `gorm:"type:text;not null;default:'';check:chk_egress_subscription_sources_proxy_url,length(encrypted_proxy_url) <= 65536"`
 	RefreshIntervalSeconds int    `gorm:"not null;default:900;check:chk_egress_subscription_sources_refresh,refresh_interval_seconds BETWEEN 60 AND 86400"`
 	DefaultAccountCapacity int    `gorm:"not null;default:0;check:chk_egress_subscription_sources_capacity,default_account_capacity BETWEEN 0 AND 100000"`
 	LastSyncedAt           *time.Time
@@ -532,24 +535,24 @@ type egressNodeModel struct {
 func (egressNodeModel) TableName() string { return "egress_nodes" }
 
 type egressOperationsConfigModel struct {
-	ID                            uint64    `gorm:"primaryKey;check:chk_egress_operations_config_id,id = 1"`
-	ProbeProvider                 string    `gorm:"size:16;not null;default:cloudflare;check:chk_egress_operations_config_probe_provider,probe_provider IN ('ipinfo','cloudflare')"`
-	ProbeIntervalSeconds          int       `gorm:"not null;default:900;check:chk_egress_operations_config_probe_interval,probe_interval_seconds BETWEEN 60 AND 86400"`
-	AutoAssignEnabled             bool      `gorm:"not null;default:false"`
-	AutoBalanceEnabled            bool      `gorm:"not null;default:false"`
-	AssignmentIntervalSeconds     int       `gorm:"not null;default:300;check:chk_egress_operations_config_assignment_interval,assignment_interval_seconds BETWEEN 60 AND 86400"`
-	EncryptedSubscriptionProxyURL string    `gorm:"type:text;not null;default:'';check:chk_egress_operations_config_subscription_proxy,length(encrypted_subscription_proxy_url) <= 65536"`
-	BuildFallbackMode             string    `gorm:"size:16;not null;default:none"`
-	BuildFallbackNodeID           uint64    `gorm:"not null;default:0"`
-	WebFallbackMode               string    `gorm:"size:16;not null;default:none"`
-	WebFallbackNodeID             uint64    `gorm:"not null;default:0"`
-	ConsoleFallbackMode           string    `gorm:"size:16;not null;default:none"`
-	ConsoleFallbackNodeID         uint64    `gorm:"not null;default:0"`
-	WebAssetFallbackMode          string    `gorm:"size:16;not null;default:none"`
-	WebAssetFallbackNodeID        uint64    `gorm:"not null;default:0"`
-	ConsoleAssetFallbackMode      string    `gorm:"size:16;not null;default:none"`
-	ConsoleAssetFallbackNodeID    uint64    `gorm:"not null;default:0"`
-	UpdatedAt                     time.Time `gorm:"not null"`
+	ID                                  uint64    `gorm:"primaryKey;check:chk_egress_operations_config_id,id = 1"`
+	ProbeProvider                       string    `gorm:"size:16;not null;default:cloudflare;check:chk_egress_operations_config_probe_provider,probe_provider IN ('ipinfo','cloudflare')"`
+	ProbeIntervalSeconds                int       `gorm:"not null;default:900;check:chk_egress_operations_config_probe_interval,probe_interval_seconds BETWEEN 60 AND 86400"`
+	AutoAssignEnabled                   bool      `gorm:"not null;default:false"`
+	AutoBalanceEnabled                  bool      `gorm:"not null;default:false"`
+	AssignmentIntervalSeconds           int       `gorm:"not null;default:300;check:chk_egress_operations_config_assignment_interval,assignment_interval_seconds BETWEEN 60 AND 86400"`
+	SubscriptionProxyMigrationCompleted bool      `gorm:"not null;default:false"`
+	BuildFallbackMode                   string    `gorm:"size:16;not null;default:none"`
+	BuildFallbackNodeID                 uint64    `gorm:"not null;default:0"`
+	WebFallbackMode                     string    `gorm:"size:16;not null;default:none"`
+	WebFallbackNodeID                   uint64    `gorm:"not null;default:0"`
+	ConsoleFallbackMode                 string    `gorm:"size:16;not null;default:none"`
+	ConsoleFallbackNodeID               uint64    `gorm:"not null;default:0"`
+	WebAssetFallbackMode                string    `gorm:"size:16;not null;default:none"`
+	WebAssetFallbackNodeID              uint64    `gorm:"not null;default:0"`
+	ConsoleAssetFallbackMode            string    `gorm:"size:16;not null;default:none"`
+	ConsoleAssetFallbackNodeID          uint64    `gorm:"not null;default:0"`
+	UpdatedAt                           time.Time `gorm:"not null"`
 }
 
 func (egressOperationsConfigModel) TableName() string { return "egress_operations_config" }

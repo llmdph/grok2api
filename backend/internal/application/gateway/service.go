@@ -44,6 +44,8 @@ var (
 	ErrConversationUnsupported    = errors.New("目标模型不支持当前对话协议")
 	ErrVideoInputTooLarge         = errors.New("视频参考图片编码后总输入超过 32 MiB")
 	ErrVideoInputUnavailable      = errors.New("视频临时输入不存在或已过期")
+	ErrVideoParameterInvalid      = errors.New("视频请求参数无效")
+	ErrVideoOperationUnsupported  = errors.New("视频编辑/延长仅支持路由到 Console grok-imagine-video")
 	ErrLedgerUnavailable          = errors.New("计费账本暂不可用")
 )
 
@@ -111,6 +113,11 @@ type Input struct {
 }
 
 type Usage struct {
+	// Reported distinguishes a real upstream/estimated usage object from the
+	// zero value used when a response fails before usage is available. Token
+	// counts may legitimately all be zero, so the numeric fields cannot carry
+	// this presence information by themselves.
+	Reported               bool
 	InputTokens            int64
 	CachedInputTokens      int64
 	OutputTokens           int64
@@ -160,8 +167,8 @@ type routeResolver interface {
 type videoAssetStore interface {
 	SaveVideo(ctx context.Context, jobID, contentType string, body io.Reader) (mediadomain.Asset, error)
 	OpenVideo(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error)
-	OpenInputImage(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error)
-	ReleaseInputImages(ctx context.Context, references []string) error
+	OpenInputAsset(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error)
+	ReleaseInputAssets(ctx context.Context, references []string) error
 }
 
 type accountModelSyncer interface {
@@ -707,10 +714,19 @@ func routeTargetSeed(input Input) string {
 
 // selectMediaRoute selects a same-name route that satisfies media capability, key permissions, and Provider support.
 func (s *Service) selectMediaRoute(routes []modeldomain.Route, key clientkey.Key, capability modeldomain.Capability, providerSupported func(accountdomain.Provider) bool) (modeldomain.Route, error) {
+	eligible, fallback, err := s.eligibleMediaRoutes(routes, key, capability, providerSupported)
+	if err != nil {
+		return fallback, err
+	}
+	return eligible[0], nil
+}
+
+func (s *Service) eligibleMediaRoutes(routes []modeldomain.Route, key clientkey.Key, capability modeldomain.Capability, providerSupported func(accountdomain.Provider) bool) ([]modeldomain.Route, modeldomain.Route, error) {
 	if len(routes) == 0 {
-		return modeldomain.Route{}, ErrModelNotFound
+		return nil, modeldomain.Route{}, ErrModelNotFound
 	}
 	fallback := routes[0]
+	eligible := make([]modeldomain.Route, 0, len(routes))
 	accountScope := key.AccountScope()
 	capabilityMatched := false
 	scopeMatched := false
@@ -730,19 +746,79 @@ func (s *Service) selectMediaRoute(routes []modeldomain.Route, key clientkey.Key
 		}
 		allowed = true
 		if providerSupported(route.Provider) {
-			return route, nil
+			eligible = append(eligible, route)
 		}
 	}
+	if len(eligible) > 0 {
+		return eligible, fallback, nil
+	}
 	if !capabilityMatched {
-		return fallback, ErrModelNotFound
+		return nil, fallback, ErrModelNotFound
 	}
 	if !scopeMatched {
-		return fallback, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
+		return nil, fallback, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
 	}
 	if !allowed {
-		return fallback, clientkeyapp.ErrModelNotAllowed
+		return nil, fallback, clientkeyapp.ErrModelNotAllowed
 	}
-	return fallback, ErrNoAvailableAccount
+	return nil, fallback, ErrNoAvailableAccount
+}
+
+// selectSchedulableMediaRoute resolves a concrete same-name media target and
+// its immutable account plan together. A cooling or exhausted first target
+// therefore cannot hide a healthy target from another Provider.
+func (s *Service) selectSchedulableMediaRoute(ctx context.Context, routes []modeldomain.Route, key clientkey.Key, capability modeldomain.Capability, consumesQuota bool, providerSupported func(accountdomain.Provider) bool) (modeldomain.Route, *selectionSession, error) {
+	return s.selectSchedulableMediaRouteWithQuotaMode(ctx, routes, key, capability, consumesQuota, providerSupported, nil)
+}
+
+func (s *Service) selectSchedulableMediaRouteWithQuotaMode(ctx context.Context, routes []modeldomain.Route, key clientkey.Key, capability modeldomain.Capability, consumesQuota bool, providerSupported func(accountdomain.Provider) bool, resolveQuotaMode func(modeldomain.Route) string) (modeldomain.Route, *selectionSession, error) {
+	eligible, fallback, err := s.eligibleMediaRoutes(routes, key, capability, providerSupported)
+	if err != nil {
+		return fallback, nil, err
+	}
+	return s.selectSchedulableEligibleMediaRouteWithQuotaMode(ctx, eligible, key, consumesQuota, resolveQuotaMode)
+}
+
+// selectSchedulableEligibleMediaRouteWithQuotaMode selects an account plan
+// from routes that already passed capability, client-key, and Provider support
+// checks. Callers may apply request-specific route constraints between the
+// eligibility and scheduling phases without evaluating disallowed routes.
+func (s *Service) selectSchedulableEligibleMediaRouteWithQuotaMode(ctx context.Context, eligible []modeldomain.Route, key clientkey.Key, consumesQuota bool, resolveQuotaMode func(modeldomain.Route) string) (modeldomain.Route, *selectionSession, error) {
+	if len(eligible) == 0 {
+		return modeldomain.Route{}, nil, ErrNoAvailableAccount
+	}
+	var firstSelectionErr error
+	for _, route := range eligible {
+		quotaMode := ""
+		if consumesQuota {
+			if resolveQuotaMode != nil {
+				quotaMode = resolveQuotaMode(route)
+			} else {
+				quotaMode = s.providers.QuotaMode(route.Provider, route.UpstreamModel)
+			}
+		}
+		session, selectionErr := s.selector.beginSelectionSessionForKey(
+			ctx,
+			route.Provider,
+			route.ID,
+			route.UpstreamModel,
+			quotaMode,
+			"",
+			nil,
+			false,
+			key.AccountScope(),
+		)
+		if selectionErr == nil {
+			return route, session, nil
+		}
+		if firstSelectionErr == nil {
+			firstSelectionErr = selectionErr
+		}
+	}
+	if firstSelectionErr == nil {
+		firstSelectionErr = ErrNoAvailableAccount
+	}
+	return eligible[0], nil, firstSelectionErr
 }
 
 func (s *Service) createResponseAt(ctx context.Context, input Input, path string) (*Result, error) {
@@ -838,6 +914,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			return nil, err
 		}
 	}
+	reasoningEffort := resolveRequestReasoningEffort(input.Body, aliasEffort, operation)
 	if routeErr != nil && !errors.Is(routeErr, clientkeyapp.ErrModelNotAllowed) {
 		return nil, routeErr
 	}
@@ -857,7 +934,8 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	auditBase := audit.Record{
 		EventID: eventID, RequestID: input.RequestID, ClientKeyID: input.ClientKey.ID, ClientKeyName: input.ClientKey.Name,
 		ModelRouteID: route.ID, ModelPublicID: publicModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
-		Provider: string(route.Provider), Operation: operation, UsageSource: usageSource, Streaming: input.Streaming,
+		ReasoningEffort: reasoningEffort,
+		Provider: string(route.Provider), Operation: operation, UsageSource: audit.UsageSourceNone, Streaming: input.Streaming,
 		MediaInputImages: mediaSummary.InputImages,
 	}
 	if errors.Is(routeErr, clientkeyapp.ErrModelNotAllowed) {
@@ -1283,7 +1361,7 @@ attemptLoop:
 				budget := newFinalizationBudget(string(operation), string(route.Provider))
 				if isUpstreamStreamFailure(errorCode) {
 					if err := budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
-						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, http.StatusBadGateway, 0)
+						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, 0, 0)
 					}); err != nil {
 						s.logger.Warn("stream_failure_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
 					}
@@ -1291,6 +1369,9 @@ attemptLoop:
 				lease.Release()
 				now := time.Now().UTC()
 				record := auditBase
+				if usage.Reported {
+					record.UsageSource = usageSource
+				}
 				record.AccountID = &accountID
 				record.AccountName = credential.Name
 				record.StatusCode = response.StatusCode
@@ -1300,7 +1381,7 @@ attemptLoop:
 				record.ReasoningTokens = usage.ReasoningTokens
 				record.TotalTokens = usage.TotalTokens
 				record.CostInUSDTicks = usage.CostInUSDTicks
-				imagePricing, imagePriced := audit.EstimateOfficialImageCost(pricingModel, "", response.QuotaUnits)
+				imagePricing, imagePriced := audit.EstimateOfficialImageCost(pricingModel, "", "", response.QuotaUnits)
 				if imagePriced {
 					record.MediaOutputImages = int64(max(0, response.QuotaUnits))
 				}
@@ -1509,6 +1590,35 @@ func (s *Service) queueAccountModelSync(accountID uint64) {
 		}
 		logger.Info("model_etag_refresh_completed", "account_id", accountID, "models", count)
 	}()
+}
+
+func resolveRequestReasoningEffort(body []byte, aliasEffort string, operation audit.Operation) string {
+	if effort := strings.TrimSpace(aliasEffort); effort != "" {
+		return effort
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	switch operation {
+	case audit.OperationChat:
+		if effort, ok := payload["reasoning_effort"].(string); ok {
+			return strings.TrimSpace(effort)
+		}
+	case audit.OperationMessages:
+		if config, ok := payload["output_config"].(map[string]any); ok {
+			if effort, ok := config["effort"].(string); ok {
+				return strings.TrimSpace(effort)
+			}
+		}
+	default:
+		if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+			if effort, ok := reasoning["effort"].(string); ok {
+				return strings.TrimSpace(effort)
+			}
+		}
+	}
+	return ""
 }
 
 func rewriteAliasedModel(body []byte, publicModel, reasoningEffort string, operation audit.Operation) ([]byte, error) {
