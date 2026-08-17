@@ -29,6 +29,14 @@ func (h *Handler) proxyRealtimeWebSocket(c *gin.Context) {
 	h.proxyVoiceWebSocket(c, "/realtime")
 }
 
+func (h *Handler) proxyTTSWebSocket(c *gin.Context) {
+	if !clientws.IsWebSocketUpgrade(c.Request) {
+		writeOpenAIError(c, http.StatusMethodNotAllowed, "invalid_request", "TTS 流式接口需要 WebSocket Upgrade")
+		return
+	}
+	h.proxyVoiceWebSocket(c, "/tts")
+}
+
 func (h *Handler) proxySTTWebSocket(c *gin.Context) {
 	if !clientws.IsWebSocketUpgrade(c.Request) {
 		writeOpenAIError(c, http.StatusMethodNotAllowed, "invalid_request", "STT 流式接口需要 WebSocket Upgrade")

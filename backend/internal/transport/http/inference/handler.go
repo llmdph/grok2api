@@ -17,7 +17,6 @@ import (
 
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
-	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
