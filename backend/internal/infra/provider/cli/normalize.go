@@ -139,10 +139,10 @@ func applyBuildResponseDefaults(payload map[string]json.RawMessage) (bool, error
 }
 
 // normalizeBuildReasoningEffortPayload maps client aliases to levels accepted by
-// the selected Grok model. Grok 4.5 and unknown models retain the proven defensive
+// the selected Grok model. Unknown models retain the proven defensive
 // xhigh/max -> high behavior for models without an xhigh wire contract. Models
-// that explicitly support xhigh keep xhigh and map the client-only max alias to
-// that highest verified upstream level.
+// that explicitly support xhigh (including grok-4.5/4.6) keep xhigh and map the
+// client-only max alias to that highest verified upstream level.
 func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, model string) bool {
 	raw, exists := payload["reasoning"]
 	if !exists || isEmptyJSON(raw) {

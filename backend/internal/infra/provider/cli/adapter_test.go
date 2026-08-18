@@ -927,7 +927,7 @@ func TestForwardResponsePreservesClaudeCodeMessagesOptions(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if payload["instructions"] != "legacy system" || payload["store"] != false || payload["reasoning"].(map[string]any)["effort"] != "high" || payload["prompt_cache_key"] != "messages-cache-key" {
+		if payload["instructions"] != "legacy system" || payload["store"] != false || payload["reasoning"].(map[string]any)["effort"] != "xhigh" || payload["prompt_cache_key"] != "messages-cache-key" {
 			t.Fatalf("upstream payload = %#v", payload)
 		}
 		expectedSessionID, err := grokSessionID("messages-cache-key")

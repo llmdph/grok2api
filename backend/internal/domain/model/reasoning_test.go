@@ -11,8 +11,9 @@ func TestSupportedReasoningEffortsPerModel(t *testing.T) {
 		model string
 		want  []string
 	}{
-		{model: "grok-4.5", want: []string{"low", "medium", "high"}},
-		{model: "Build/grok-4.5", want: []string{"low", "medium", "high"}},
+		{model: "grok-4.5", want: []string{"low", "medium", "high", "xhigh"}},
+		{model: "Build/grok-4.5", want: []string{"low", "medium", "high", "xhigh"}},
+		{model: "Console/grok-4.5", want: []string{"low", "medium", "high", "xhigh"}},
 		{model: "grok-4.3", want: []string{"none", "low", "medium", "high"}},
 		{model: "grok-4.20-0309-reasoning", want: []string{"low", "medium", "high"}},
 		{model: "Console/grok-4.20-0309-reasoning", want: []string{}},
@@ -35,8 +36,11 @@ func TestSupportedReasoningEffortsPerModel(t *testing.T) {
 			}
 		}
 	}
-	if SupportsReasoningEffort("grok-4.5", "none") || SupportsReasoningEffort("grok-4.5", "xhigh") || SupportsReasoningEffort("grok-4.5", "max") {
-		t.Fatal("grok-4.5 must not advertise none/xhigh/max")
+	if SupportsReasoningEffort("grok-4.5", "none") || SupportsReasoningEffort("grok-4.5", "max") {
+		t.Fatal("grok-4.5 must not advertise none/max")
+	}
+	if !SupportsReasoningEffort("grok-4.5", "xhigh") || !SupportsReasoningEffort("Console/grok-4.5", "xhigh") {
+		t.Fatal("grok-4.5 must advertise xhigh")
 	}
 	if !SupportsReasoningEffort("grok-4.3", "none") || SupportsReasoningEffort("grok-4.3", "xhigh") {
 		t.Fatal("grok-4.3 effort support mismatch")
@@ -84,7 +88,7 @@ func TestParseReasoningModelAlias(t *testing.T) {
 		{name: "grok-4.5 low", input: "grok-4.5-low", wantBase: "grok-4.5", wantLevel: "low", wantOK: true},
 		{name: "grok-4.5 high", input: "grok-4.5-high", wantBase: "grok-4.5", wantLevel: "high", wantOK: true},
 		{name: "grok-4.5 rejects none", input: "grok-4.5-none", wantOK: false},
-		{name: "grok-4.5 rejects xhigh", input: "grok-4.5-xhigh", wantOK: false},
+		{name: "grok-4.5 xhigh", input: "grok-4.5-xhigh", wantBase: "grok-4.5", wantLevel: "xhigh", wantOK: true},
 		{name: "grok-4.3 none", input: "grok-4.3-none", wantBase: "grok-4.3", wantLevel: "none", wantOK: true},
 		{name: "xhigh before high", input: "grok-4.20-multi-agent-0309-xhigh", wantBase: "grok-4.20-multi-agent-0309", wantLevel: "xhigh", wantOK: true},
 		{name: "grok-4.6 xhigh", input: "grok-4.6-xhigh", wantBase: "grok-4.6", wantLevel: "xhigh", wantOK: true},
@@ -106,7 +110,7 @@ func TestParseReasoningModelAlias(t *testing.T) {
 }
 
 func TestReasoningAliasPublicIDs(t *testing.T) {
-	if got := ReasoningAliasPublicIDs("grok-4.5"); len(got) != 3 || got[0] != "grok-4.5-low" || got[2] != "grok-4.5-high" {
+	if got := ReasoningAliasPublicIDs("grok-4.5"); len(got) != 4 || got[0] != "grok-4.5-low" || got[3] != "grok-4.5-xhigh" {
 		t.Fatalf("grok-4.5 aliases = %#v", got)
 	}
 	if got := ReasoningAliasPublicIDs("grok-4.6"); len(got) != 4 || got[0] != "grok-4.6-low" || got[3] != "grok-4.6-xhigh" {
