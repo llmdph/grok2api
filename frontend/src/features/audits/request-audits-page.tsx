@@ -681,6 +681,7 @@ function reasoningEffortTone(effort: NonNullable<AuditDTO["reasoningEffort"]>): 
     case "xhigh": return "text-rose-600 dark:text-rose-400";
     case "auto": return "text-violet-600 dark:text-violet-400";
     case "fixed": return "text-indigo-600 dark:text-indigo-400";
+    default: return "text-muted-foreground";
   }
 }
 

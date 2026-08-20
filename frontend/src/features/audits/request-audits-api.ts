@@ -32,7 +32,6 @@ export type AuditDTO = {
   modelRouteId: string;
   modelPublicId?: string;
   modelUpstreamModel?: string;
-  reasoningEffort?: string;
   provider: "grok_build" | "grok_web" | "grok_console";
   operation: "responses" | "compaction" | "chat" | "messages" | "image" | "image_edit" | "video" | "tts" | "stt" | "realtime" | "voice";
   usageSource: "upstream" | "estimated" | "none";
