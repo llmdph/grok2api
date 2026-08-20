@@ -255,7 +255,6 @@ func toAuditDomain(value requestAuditModel) audit.Record {
 	return audit.Record{
 		ID: value.ID, EventID: value.EventID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName, ClientIP: value.ClientIP,
 		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
-		ReasoningEffort: value.ReasoningEffort,
 		Provider: value.Provider, Operation: audit.Operation(value.Operation), UsageSource: audit.UsageSource(value.UsageSource),
 		ReasoningEffort: value.ReasoningEffort,
 		AccountID:       value.AccountID, AccountName: value.AccountName,

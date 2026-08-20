@@ -354,7 +354,6 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
 	row := requestAuditModel{
 		EventID: truncate(eventID, 64), RequestID: truncate(value.RequestID, 64), ClientKeyID: value.ClientKeyID, ClientKeyName: truncate(value.ClientKeyName, 160), ClientIP: strings.TrimSpace(value.ClientIP),
 		ModelRouteID: value.ModelRouteID, ModelPublicID: truncate(value.ModelPublicID, 255), ModelUpstreamModel: truncate(value.ModelUpstreamModel, 255),
-		ReasoningEffort: truncate(value.ReasoningEffort, 32),
 		Provider: truncate(provider, 32), Operation: string(operation), UsageSource: string(usageSource),
 		ReasoningEffort: audit.NormalizeReasoningEffort(value.ReasoningEffort),
 		AccountID:       value.AccountID, AccountName: truncate(value.AccountName, 160),

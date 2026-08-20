@@ -92,7 +92,6 @@ type auditResponse struct {
 	ModelRouteID            uint64                    `json:"modelRouteId,string"`
 	ModelPublicID           string                    `json:"modelPublicId,omitempty"`
 	ModelUpstreamModel      string                    `json:"modelUpstreamModel,omitempty"`
-	ReasoningEffort         string                    `json:"reasoningEffort,omitempty"`
 	Provider                string                    `json:"provider"`
 	Operation               string                    `json:"operation"`
 	UsageSource             string                    `json:"usageSource"`
@@ -477,7 +476,6 @@ func newAuditResponse(value auditdomain.Record) auditResponse {
 	return auditResponse{
 		ID: value.ID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName, ClientIP: value.ClientIP,
 		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
-		ReasoningEffort: value.ReasoningEffort,
 		Provider: value.Provider, Operation: string(value.Operation), UsageSource: string(value.UsageSource),
 		ReasoningEffort: value.ReasoningEffort,
 		AccountID:       value.AccountID, AccountName: value.AccountName,
