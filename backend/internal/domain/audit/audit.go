@@ -76,6 +76,7 @@ type Record struct {
 	RequestID               string
 	ClientKeyID             uint64
 	ClientKeyName           string
+	ClientIP                string
 	ModelRouteID            uint64
 	ModelPublicID           string
 	ModelUpstreamModel      string
@@ -83,6 +84,7 @@ type Record struct {
 	Provider                string
 	Operation               Operation
 	UsageSource             UsageSource
+	ReasoningEffort         string
 	AccountID               *uint64
 	AccountName             string
 	EgressNodeID            *uint64
