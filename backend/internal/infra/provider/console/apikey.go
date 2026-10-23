@@ -152,7 +152,7 @@ func (a *Adapter) saveConsoleAPIKeyID(ctx context.Context, accountID uint64, api
 // resolveConsoleAPIKey is the read-then-create sequence: reuse any enabled
 // team key from the Console home page and create one only when none exists.
 func (a *Adapter) resolveConsoleAPIKey(ctx context.Context, credential account.Credential, ssoToken string, lease *infraegress.Lease) (string, error) {
-	home, err := a.readConsoleHome(ctx, ssoToken, lease)
+	home, err := a.readConsoleHome(ctx, credential, ssoToken, lease)
 	if err != nil {
 		return "", err
 	}
@@ -167,7 +167,7 @@ func (a *Adapter) resolveConsoleAPIKey(ctx context.Context, credential account.C
 	}
 	// The create response carries the secret key body, not its id. Re-read the
 	// home page so only the stable apiKeyId is ever used and stored.
-	confirmed, err := a.readConsoleHome(ctx, ssoToken, lease)
+	confirmed, err := a.readConsoleHome(ctx, credential, ssoToken, lease)
 	if err != nil {
 		return "", err
 	}
@@ -185,7 +185,7 @@ type consoleHome struct {
 // readConsoleHome loads the Console landing page, which 307-redirects to
 // /team/<teamId>. Only same-origin hops are followed; the team id is taken
 // from the final path because it is authoritative for the SSO's team.
-func (a *Adapter) readConsoleHome(ctx context.Context, ssoToken string, lease *infraegress.Lease) (consoleHome, error) {
+func (a *Adapter) readConsoleHome(ctx context.Context, credential account.Credential, ssoToken string, lease *infraegress.Lease) (consoleHome, error) {
 	origin := consoleOrigin(a.config().BaseURL)
 	current, err := url.Parse(origin + "/")
 	if err != nil {
@@ -197,7 +197,7 @@ func (a *Adapter) readConsoleHome(ctx context.Context, ssoToken string, lease *i
 		if err != nil {
 			return consoleHome{}, err
 		}
-		applyBrowserHeaders(request, ssoToken, lease)
+		applyBrowserHeaders(request, ssoToken, lease, credential)
 		request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 		request.Header.Set("Sec-Fetch-Dest", "document")
 		request.Header.Set("Sec-Fetch-Mode", "navigate")
