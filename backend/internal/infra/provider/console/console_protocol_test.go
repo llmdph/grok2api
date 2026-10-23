@@ -552,7 +552,7 @@ func TestReadConsoleHomeFollowsTeamRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	home, err := adapter.readConsoleHome(context.Background(), "test-sso", lease)
+	home, err := adapter.readConsoleHome(context.Background(), credential, "test-sso", lease)
 	if err != nil {
 		t.Fatal(err)
 	}
