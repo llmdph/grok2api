@@ -315,21 +315,8 @@ func (s *Service) SaveInputVideo(ctx context.Context, contentType string, body i
 
 	s.inputSaveMu.Lock()
 	defer s.inputSaveMu.Unlock()
-	cfg := s.runtimeConfig()
-	total, err := s.assets.TotalMediaAssetBytes(ctx)
-	if err != nil {
+	if err := s.admitInputBytes(ctx, staged.SizeBytes); err != nil {
 		return mediadomain.Asset{}, err
-	}
-	capacityLimit := cleanupThresholdBytes(cfg)
-	if capacityLimit <= 0 || capacityLimit > cfg.MaxTotalBytes {
-		capacityLimit = cfg.MaxTotalBytes
-	}
-	if staged.SizeBytes > capacityLimit || total > capacityLimit-staged.SizeBytes {
-		select {
-		case s.cleanupSignal <- struct{}{}:
-		default:
-		}
-		return mediadomain.Asset{}, ErrMediaCapacity
 	}
 	expiresAt := time.Now().UTC().Add(InputAssetTTL)
 	return s.commitStagedVideo(ctx, staged, time.Now().UTC(), &expiresAt)

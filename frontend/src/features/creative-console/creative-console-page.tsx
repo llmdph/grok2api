@@ -1,7 +1,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ArrowUp, AudioLines, BrainCircuit, Check, CheckCircle2, Clock3, ExternalLink, Globe, History, ImageIcon, ImagePlus, ImageUpscale, Images, Loader2, MessageSquareText, Mic, Pencil, RefreshCw, Sparkle, Square, SquarePen, Trash2, TriangleAlert, TvMinimal, Upload, Video, Wrench, X } from "lucide-react";
 import { marked } from "marked";
-import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 
@@ -1043,6 +1043,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   });
 
   // 本地媒体进入有 TTL 的隐藏临时区；视频任务只持久化短 file_id，不写入图库或公开 URL。
+  const [imageDropTarget, setImageDropTarget] = useState<"" | "image" | "reference">("");
   const uploadMutation = useMutation({
     mutationFn: async ({ file, kind, selectionVersion }: { file: File; kind: "image" | "reference"; selectionVersion: number }) => {
       if (file.type && !file.type.startsWith("image/")) throw new Error(t("creativeConsole.errors.invalidImage"));
@@ -1067,6 +1068,56 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
       setImageFileID("");
     },
   });
+
+
+  function queueLocalImage(file: File, kind: "image" | "reference") {
+    if (kind === "image") {
+      const selectionVersion = imageSelectionVersionRef.current + 1;
+      imageSelectionVersionRef.current = selectionVersion;
+      referenceSelectionVersionRef.current += 1;
+      setImageURL("");
+      setImageFileID("");
+      setReferenceURL("");
+      setReferenceFileID("");
+      setReferenceVoiceId("");
+    } else {
+      const selectionVersion = referenceSelectionVersionRef.current + 1;
+      referenceSelectionVersionRef.current = selectionVersion;
+      imageSelectionVersionRef.current += 1;
+      setReferenceURL("");
+      setReferenceFileID("");
+      setImageURL("");
+      setImageFileID("");
+    }
+    uploadMutation.reset();
+    uploadMutation.mutate({ file, kind, selectionVersion: kind === "image" ? imageSelectionVersionRef.current : referenceSelectionVersionRef.current });
+  }
+
+  function imageDropHandlers(kind: "image" | "reference") {
+    return {
+      onDragEnter: (event: DragEvent<HTMLElement>) => {
+        if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
+        event.preventDefault();
+        setImageDropTarget(kind);
+      },
+      onDragOver: (event: DragEvent<HTMLElement>) => {
+        if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "copy";
+        setImageDropTarget(kind);
+      },
+      onDragLeave: (event: DragEvent<HTMLElement>) => {
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        setImageDropTarget((current) => current === kind ? "" : current);
+      },
+      onDrop: (event: DragEvent<HTMLElement>) => {
+        event.preventDefault();
+        setImageDropTarget("");
+        const file = Array.from(event.dataTransfer?.files ?? []).find((item) => !item.type || item.type.startsWith("image/"));
+        if (file) queueLocalImage(file, kind);
+      },
+    };
+  }
 
   const videoUploadMutation = useMutation({
     mutationFn: async ({ file }: { file: File; selectionVersion: number }) => {
@@ -1178,11 +1229,11 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
                 <>
                 <Popover>
                   <PopoverTrigger asChild>
-                    <Button type="button" variant="ghost" size="sm" className={cn("h-8 gap-1.5 px-2 font-normal", hasFirstFrame && "bg-secondary/70 text-foreground")} aria-label={t("creativeConsole.firstFrameImage")} disabled={isReferenceMode}>
+                    <Button type="button" variant="ghost" size="sm" className={cn("h-8 gap-1.5 px-2 font-normal", hasFirstFrame && "bg-secondary/70 text-foreground", imageDropTarget === "image" && "ring-2 ring-primary")} aria-label={t("creativeConsole.firstFrameImage")} disabled={isReferenceMode} {...imageDropHandlers("image")}>
                       <ImagePlus />{hasFirstFrame ? t("creativeConsole.firstFrameImageAdded") : t("creativeConsole.firstFrameImageShort")}
                     </Button>
                   </PopoverTrigger>
-                  <PopoverContent align="start" className="w-80 p-3">
+                  <PopoverContent align="start" className={cn("w-80 p-3", imageDropTarget === "image" && "ring-2 ring-primary")} {...imageDropHandlers("image")}>
                     <div className="mb-2 text-xs font-medium">{t("creativeConsole.firstFrameImage")}</div>
                     <div className="flex items-center gap-2">
                       <Input id="video-image" type="url" value={imageURL} onChange={(event) => { imageSelectionVersionRef.current += 1; referenceSelectionVersionRef.current += 1; setImageURL(event.target.value); setImageFileID(""); setReferenceURL(""); setReferenceFileID(""); setReferenceVoiceId(""); }} placeholder={imageFileID ? t("creativeConsole.firstFrameImageAdded") : "https://..."} aria-label={t("creativeConsole.firstFrameImage")} />
@@ -1214,16 +1265,17 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
                       {uploadMutation.isPending ? <Loader2 className="animate-spin" /> : <Upload />}
                       {t("creativeConsole.uploadImage")}
                     </Button>
+                    <p className="mt-1 text-[11px] text-muted-foreground">{t("creativeConsole.dropImage")}</p>
                     {uploadMutation.isError ? <p className="mt-1 text-[11px] text-destructive">{uploadMutation.error.message}</p> : null}
                   </PopoverContent>
                 </Popover>
                 <Popover>
                   <PopoverTrigger asChild>
-                    <Button type="button" variant="ghost" size="sm" className={cn("h-8 gap-1.5 px-2 font-normal", hasReferenceImage && "bg-secondary/70 text-foreground")} aria-label={t("creativeConsole.referenceImage")} disabled={hasFirstFrame}>
+                    <Button type="button" variant="ghost" size="sm" className={cn("h-8 gap-1.5 px-2 font-normal", hasReferenceImage && "bg-secondary/70 text-foreground", imageDropTarget === "reference" && "ring-2 ring-primary")} aria-label={t("creativeConsole.referenceImage")} disabled={hasFirstFrame} {...imageDropHandlers("reference")}>
                       <Images />{hasReferenceImage ? t("creativeConsole.referenceImageAdded") : t("creativeConsole.referenceImageShort")}
                     </Button>
                   </PopoverTrigger>
-                  <PopoverContent align="start" className="w-80 p-3">
+                  <PopoverContent align="start" className={cn("w-80 p-3", imageDropTarget === "reference" && "ring-2 ring-primary")} {...imageDropHandlers("reference")}>
                     <div className="mb-2 text-xs font-medium">{t("creativeConsole.referenceImage")}</div>
                     <div className="flex items-center gap-2">
                       <Input id="video-reference" type="url" value={referenceURL} onChange={(event) => { referenceSelectionVersionRef.current += 1; imageSelectionVersionRef.current += 1; setReferenceURL(event.target.value); setReferenceFileID(""); setImageURL(""); setImageFileID(""); }} placeholder={referenceFileID ? t("creativeConsole.referenceImageAdded") : "https://..."} aria-label={t("creativeConsole.referenceImage")} />
@@ -1254,6 +1306,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
                       {uploadMutation.isPending ? <Loader2 className="animate-spin" /> : <Upload />}
                       {t("creativeConsole.uploadImage")}
                     </Button>
+                    <p className="mt-1 text-[11px] text-muted-foreground">{t("creativeConsole.dropImage")}</p>
                     {uploadMutation.isError ? <p className="mt-1 text-[11px] text-destructive">{uploadMutation.error.message}</p> : null}
                   </PopoverContent>
                 </Popover>

@@ -207,11 +207,14 @@ func TestSaveInputImageReservesCleanupHeadroom(t *testing.T) {
 		MaxImageBytes: int64(len(raw)), MaxTotalBytes: 100,
 		CleanupThresholdPercent: 50, CleanupInterval: time.Minute,
 	})
-	if _, err := service.SaveInputImage(ctx, raw); !errors.Is(err, ErrMediaCapacity) {
-		t.Fatalf("SaveInputImage error = %v, want ErrMediaCapacity", err)
+	if _, err := service.SaveInputImage(ctx, raw); err != nil {
+		t.Fatalf("SaveInputImage under hard cap error = %v", err)
 	}
 	if len(service.cleanupSignal) != 1 {
-		t.Fatal("capacity rejection did not schedule media cleanup")
+		t.Fatal("crossing the cleanup watermark did not schedule media cleanup")
+	}
+	if _, err := service.SaveInputImage(ctx, raw); !errors.Is(err, ErrMediaCapacity) {
+		t.Fatalf("SaveInputImage over hard cap error = %v, want ErrMediaCapacity", err)
 	}
 }
 

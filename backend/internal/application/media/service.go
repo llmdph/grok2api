@@ -118,20 +118,8 @@ func (s *Service) SaveInputImage(ctx context.Context, data []byte) (mediadomain.
 	}
 	s.inputSaveMu.Lock()
 	defer s.inputSaveMu.Unlock()
-	total, err := s.assets.TotalMediaAssetBytes(ctx)
-	if err != nil {
+	if err := s.admitInputBytes(ctx, int64(len(data))); err != nil {
 		return mediadomain.Asset{}, err
-	}
-	capacityLimit := cleanupThresholdBytes(cfg)
-	if capacityLimit <= 0 || capacityLimit > cfg.MaxTotalBytes {
-		capacityLimit = cfg.MaxTotalBytes
-	}
-	if int64(len(data)) > capacityLimit || total > capacityLimit-int64(len(data)) {
-		select {
-		case s.cleanupSignal <- struct{}{}:
-		default:
-		}
-		return mediadomain.Asset{}, ErrMediaCapacity
 	}
 	expiresAt := time.Now().UTC().Add(InputAssetTTL)
 	return s.saveImage(ctx, data, &expiresAt, mediadomain.InputAssetIDPrefix)
@@ -627,6 +615,45 @@ func (s *Service) runtimeConfig() Config {
 		PublicBaseURL: s.publicBaseURL,
 		MaxImageBytes: s.maxImageBytes, MaxTotalBytes: s.maxTotalBytes,
 		CleanupThresholdPercent: s.cleanupAt, CleanupInterval: s.cleanupEvery,
+	}
+}
+
+
+// admitInputBytes 只在超过媒体总容量时拒绝临时输入。
+// 清理水位线只负责触发回收，不再把仍有余量的首帧图或参考图挡在外面。
+// 调用方必须持有 inputSaveMu。
+func (s *Service) admitInputBytes(ctx context.Context, size int64) error {
+	cfg := s.runtimeConfig()
+	limit := cfg.MaxTotalBytes
+	if limit <= 0 || size <= 0 || size > limit {
+		s.signalMediaCleanup()
+		return ErrMediaCapacity
+	}
+	total, err := s.assets.TotalMediaAssetBytes(ctx)
+	if err != nil {
+		return err
+	}
+	if total > limit-size {
+		_, _ = s.Cleanup(ctx)
+		total, err = s.assets.TotalMediaAssetBytes(ctx)
+		if err != nil {
+			return err
+		}
+		if total > limit-size {
+			s.signalMediaCleanup()
+			return ErrMediaCapacity
+		}
+	}
+	if total+size > cleanupThresholdBytes(cfg) {
+		s.signalMediaCleanup()
+	}
+	return nil
+}
+
+func (s *Service) signalMediaCleanup() {
+	select {
+	case s.cleanupSignal <- struct{}{}:
+	default:
 	}
 }
 
