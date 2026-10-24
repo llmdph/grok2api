@@ -1201,15 +1201,13 @@ func (s *Selector) quotaConsumptionSnapshot(provider account.Provider) map[accou
 }
 
 func quotaWindowExhausted(candidate account.RoutingCandidate, consumed map[accountQuotaConsumptionKey]int, quotaMode string) bool {
-	// Console image/video free pools only schedule accounts with an upstream-confirmed
-	// remaining window. Missing or synthetic windows used to look "available" and burned
-	// attempt budget on accounts that immediately 429 with free usage quota exceeded.
-	if requiresAuthoritativeMediaQuota(quotaMode) {
-		if candidate.QuotaWindow == nil || candidate.QuotaWindow.Source != account.QuotaSourceUpstream {
-			return true
-		}
-	}
+	// Console image/video stay schedulable until an upstream usage snapshot says
+	// the window is empty. A missing row or a local placeholder is not a
+	// "no quota" response and must not take the account out of rotation.
 	if candidate.QuotaWindow == nil {
+		return false
+	}
+	if requiresAuthoritativeMediaQuota(quotaMode) && candidate.QuotaWindow.Source != account.QuotaSourceUpstream {
 		return false
 	}
 	remaining := candidate.QuotaWindow.Remaining - consumed[accountQuotaConsumptionKey{accountID: candidate.Credential.ID, mode: candidate.QuotaWindow.Mode}]

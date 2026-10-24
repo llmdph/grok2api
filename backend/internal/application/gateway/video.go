@@ -682,6 +682,12 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 					}
 					retriableCreate = true
 				}
+			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderConsole && provider.IsConsoleNoCreditsText(err.Error()):
+				// Only this upstream wording is a real "no quota" response. Leave the
+				// account out of the pool; do not invent an empty window for other 403s.
+				s.markReauthRequired(failureCtx, job.RequestID, lease.Credential, consoleNoCreditsReason)
+				failureHandled = true
+				retriableCreate = false
 			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderBuild:
 				if !account.IsBuildSuper(lease.Credential, lease.Billing) {
 					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)

@@ -1832,7 +1832,7 @@ func waitAccountCooldown(t *testing.T, accounts repository.AccountRepository, ac
 func TestBoundUpstreamRetryAfter(t *testing.T) {
 	selector := &Selector{cooldownMax: time.Minute}
 	tests := []struct {
-		name string
+		name  string
 		input time.Duration
 		want  time.Duration
 	}{
@@ -2122,7 +2122,7 @@ func TestSelectorSkipsConsoleMediaAccountsWithoutAuthoritativeQuota(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// missing deliberately has no console_video window; it must not enter the video pool.
+	// missing has no console_video window yet. It stays eligible until upstream reports an empty window.
 	if err := accounts.SaveQuotaWindows(ctx, missing.ID, "", now, []account.QuotaWindow{
 		{AccountID: missing.ID, Mode: "console", Remaining: 10, Total: 10, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
 		{AccountID: missing.ID, Mode: "console_image", Remaining: 5, Total: 5, Source: account.QuotaSourceUpstream, SyncedAt: &now, UpdatedAt: now},
@@ -2140,20 +2140,34 @@ func TestSelectorSkipsConsoleMediaAccountsWithoutAuthoritativeQuota(t *testing.T
 		t.Fatalf("selected account = %d, want available account %d", lease.Credential.ID, available.ID)
 	}
 
-	// After excluding the only remaining-video account, selection must fail closed.
-	if _, err := selector.Acquire(ctx, account.ProviderConsole, 0, "grok-imagine-video", "console_video", "", map[uint64]bool{available.ID: true}, false); err == nil {
-		t.Fatal("expected no schedulable console video accounts after excluding remaining quota")
+	// Confirmed remaining quota is preferred, but an account with no snapshot is
+	// still schedulable once that account is excluded.
+	lease, err = selector.Acquire(ctx, account.ProviderConsole, 0, "grok-imagine-video", "console_video", "", map[uint64]bool{available.ID: true}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != missing.ID {
+		t.Fatalf("selected account = %d, want unsynced account %d", lease.Credential.ID, missing.ID)
+	}
+
+	if _, err := selector.Acquire(ctx, account.ProviderConsole, 0, "grok-imagine-video", "console_video", "", map[uint64]bool{available.ID: true, missing.ID: true}, false); err == nil {
+		t.Fatal("expected no schedulable console video accounts after excluding unsynced and remaining quota")
 	}
 }
 
 func TestQuotaWindowExhaustedRequiresAuthoritativeConsoleMedia(t *testing.T) {
 	missing := account.RoutingCandidate{Credential: account.Credential{ID: 1}}
-	if !quotaWindowExhausted(missing, nil, "console_video") {
-		t.Fatal("missing console_video window must be treated as exhausted")
+	if quotaWindowExhausted(missing, nil, "console_video") {
+		t.Fatal("missing console_video window must stay schedulable until upstream reports no quota")
 	}
-	defaulted := account.RoutingCandidate{Credential: account.Credential{ID: 2}, QuotaWindow: &account.QuotaWindow{AccountID: 2, Mode: "console_image", Remaining: 5, Total: 5, Source: account.QuotaSourceDefault}}
-	if !quotaWindowExhausted(defaulted, nil, "console_image") {
-		t.Fatal("default console_image window must not be schedulable")
+	defaulted := account.RoutingCandidate{Credential: account.Credential{ID: 2}, QuotaWindow: &account.QuotaWindow{AccountID: 2, Mode: "console_image", Remaining: 0, Total: 0, Source: account.QuotaSourceDefault}}
+	if quotaWindowExhausted(defaulted, nil, "console_image") {
+		t.Fatal("local placeholder must not mark console media quota exhausted")
+	}
+	empty := account.RoutingCandidate{Credential: account.Credential{ID: 4}, QuotaWindow: &account.QuotaWindow{AccountID: 4, Mode: "console_video", Remaining: 0, Total: 2, Source: account.QuotaSourceUpstream}}
+	if !quotaWindowExhausted(empty, nil, "console_video") {
+		t.Fatal("upstream empty console_video window must be exhausted")
 	}
 	available := account.RoutingCandidate{Credential: account.Credential{ID: 3}, QuotaWindow: &account.QuotaWindow{AccountID: 3, Mode: "console_video", Remaining: 1, Total: 2, Source: account.QuotaSourceUpstream}}
 	if quotaWindowExhausted(available, nil, "console_video") {
@@ -2164,4 +2178,3 @@ func TestQuotaWindowExhaustedRequiresAuthoritativeConsoleMedia(t *testing.T) {
 		t.Fatal("chat console mode without a window must stay schedulable")
 	}
 }
-
