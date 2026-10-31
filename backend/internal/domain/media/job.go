@@ -15,8 +15,8 @@ const (
 // Keep the relational CHECK constraint and gateway encode guard aligned with this value.
 const MaxInputJSONBytes = 32 << 20
 
-// MaxInputImages is the maximum number of reference images accepted for a video job.
-const MaxInputImages = 8
+// MaxInputImages is the maximum number of reference images accepted for a video job. Official grok-imagine-video-1.5 allows 14; grok-imagine-video stays at 7 on Console.
+const MaxInputImages = 14
 
 // MaxInputAssetBytes limits each temporary image or video input to 20 MiB.
 const MaxInputAssetBytes = 20 << 20

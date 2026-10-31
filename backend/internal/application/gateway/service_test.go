@@ -1717,6 +1717,81 @@ func TestGenerateImageUnlimitedAttemptsRetainsEgressRetry(t *testing.T) {
 	}
 }
 
+func TestGenerateImageRotatesAfterConsolePaymentRequired(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "image-console-402.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	now := time.Now().UTC()
+	blocked, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO,
+		Name: "image-402", SourceKey: "image-402", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO,
+		Name: "image-ok", SourceKey: "image-ok", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const model = "grok-imagine-image-2.0"
+	if err := modelRepo.UpsertRoutes(ctx, []modeldomain.Route{{
+		PublicID: model, Provider: account.ProviderConsole, UpstreamModel: model,
+		Capability: modeldomain.CapabilityImage, Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, accountID := range []uint64{blocked.ID, healthy.ID} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, accountID, []string{model}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	adapter := &consoleImagePaymentAdapter{blockedID: blocked.ID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, unlimitedRoutingAttempts)
+
+	result, err := service.GenerateImage(ctx, ImageGenerationInput{
+		RequestID: "req-image-console-402", ClientKey: clientkey.Key{ID: 1, Name: "image-key"},
+		PublicModel: model, Prompt: "test", Count: 1, ResponseFormat: "url",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(result.Body)
+	result.Finalize(Usage{}, "", "")
+	_ = result.Body.Close()
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after account rotation", result.StatusCode)
+	}
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != blocked.ID || attempts[1] != healthy.ID {
+		t.Fatalf("attempts = %#v, want blocked %d then healthy %d", attempts, blocked.ID, healthy.ID)
+	}
+	recovery, err := accountRepo.GetQuotaRecovery(ctx, blocked.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.Status != account.QuotaRecoveryStatusExhausted || recovery.NextProbeAt == nil {
+		t.Fatalf("402 account recovery = %#v", recovery)
+	}
+}
+
 func TestGatewayDoesNotPersistStatelessConsoleResponses(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "console-stateless.db"))
@@ -4595,6 +4670,69 @@ func (webStoredResponseAdapter) ForwardResponse(context.Context, provider.Respon
 }
 
 type webRateLimitAdapter struct{}
+
+type consoleImagePaymentAdapter struct {
+	mu        sync.Mutex
+	blockedID uint64
+	attempts  []uint64
+}
+
+func (a *consoleImagePaymentAdapter) Provider() account.Provider { return account.ProviderConsole }
+
+func (a *consoleImagePaymentAdapter) Definition() provider.Definition {
+	return provider.Definition{
+		Provider:  account.ProviderConsole,
+		Quota:     provider.QuotaRemoteWindow,
+		Media:     provider.MediaSurface{ImageGeneration: true},
+		Inference: provider.InferencePolicy{RetryForbiddenAsEgress: true},
+	}
+}
+
+func (a *consoleImagePaymentAdapter) QuotaMode(string) string { return "console_image" }
+
+func (a *consoleImagePaymentAdapter) TierOrder(string) []account.WebTier { return nil }
+
+func (a *consoleImagePaymentAdapter) GenerateImage(_ context.Context, request provider.ImageGenerationRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	blocked := request.Credential.ID == a.blockedID
+	a.mu.Unlock()
+	if blocked {
+		header := make(http.Header)
+		header.Set("X-Should-Retry", "false")
+		return &provider.Response{
+			StatusCode: http.StatusPaymentRequired, Status: "402 Payment Required", Header: header,
+			Body: io.NopCloser(strings.NewReader(`{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits"}`)),
+		}, nil
+	}
+	return &provider.Response{
+		StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(`{"created":1,"data":[{"url":"https://example.com/ok.png"}]}`)),
+	}, nil
+}
+
+func (a *consoleImagePaymentAdapter) SyncQuota(context.Context, account.Credential) (provider.QuotaSnapshot, error) {
+	now := time.Now().UTC()
+	return provider.QuotaSnapshot{
+		SyncedAt: now,
+		Windows: []account.QuotaWindow{{
+			Mode: "console_image", Remaining: 20, Total: 20, Source: account.QuotaSourceUpstream, SyncedAt: &now,
+		}},
+	}, nil
+}
+
+func (a *consoleImagePaymentAdapter) SyncQuotaMode(_ context.Context, credential account.Credential, mode string) (account.QuotaWindow, error) {
+	now := time.Now().UTC()
+	return account.QuotaWindow{
+		AccountID: credential.ID, Mode: mode, Remaining: 20, Total: 20, Source: account.QuotaSourceUpstream, SyncedAt: &now,
+	}, nil
+}
+
+func (a *consoleImagePaymentAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
+}
 
 type webImageStreamAdapter struct {
 	mu                 sync.Mutex

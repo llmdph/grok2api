@@ -1920,7 +1920,7 @@ func TestConsoleVideoPostsReferenceAudios(t *testing.T) {
 	t.Cleanup(server.Close)
 	adapter, credential := newConsoleTestAdapter(t, server.URL)
 	result, err := adapter.GenerateVideo(context.Background(), provider.VideoRequest{
-		Credential: credential, Prompt: "speak", Duration: 8, AspectRatio: "9:16", Resolution: "720p",
+		Credential: credential, Model: "grok-imagine-video-1.5", Prompt: "speak", Duration: 8, AspectRatio: "9:16", Resolution: "720p",
 		ReferenceURLs:   []string{"https://example.com/person.png"},
 		ReferenceAudios: []string{"eve"},
 	})

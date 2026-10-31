@@ -56,6 +56,12 @@ type VideoInput struct {
 	ReferenceURLs []string
 	// ReferenceAudios are preset voice_ids for reference-to-video.
 	ReferenceAudios []string
+	// LastFrameURL pins the closing frame on grok-imagine-video-1.5.
+	LastFrameURL string
+	// Keyframes are interior pins on grok-imagine-video-1.5.
+	Keyframes []provider.VideoKeyframe
+	// GenerateAudio is forwarded only when the caller set it. Nil keeps upstream default audio.
+	GenerateAudio *bool
 	// VideoURL is required for edit/extend (official "video").
 	VideoURL string
 }
@@ -80,19 +86,17 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 		hasImage := strings.TrimSpace(input.ImageURL) != ""
 		hasRefs := len(input.ReferenceURLs) > 0
 		hasRefAudio := len(input.ReferenceAudios) > 0
-		if hasImage && (hasRefs || hasRefAudio) {
-			return media.Job{}, fmt.Errorf("image 不能与 reference_images/reference_audios 同时使用")
+		hasLastFrame := strings.TrimSpace(input.LastFrameURL) != ""
+		if err := provider.ValidateVideoKeyframes(input.Keyframes, input.Duration); err != nil {
+			return media.Job{}, err
 		}
-		if hasRefs || hasRefAudio {
-			if len(input.Prompt) == 0 {
-				return media.Job{}, fmt.Errorf("参考图/参考音频视频必须提供 prompt")
-			}
+		if provider.VideoUsesReferenceMode(len(input.ReferenceURLs), len(input.ReferenceAudios), hasLastFrame, len(input.Keyframes)) {
 			if resolution := strings.ToLower(strings.TrimSpace(input.Resolution)); resolution == "1080p" {
 				return media.Job{}, fmt.Errorf("参考图视频 resolution 最高 720p")
 			}
 		}
-		if len(input.Prompt) == 0 && !hasImage && !hasRefs && !hasRefAudio {
-			return media.Job{}, fmt.Errorf("文本生视频必须提供 prompt；图片生视频可以省略 prompt")
+		if len(input.Prompt) == 0 && !hasImage && !hasRefs && !hasRefAudio && !hasLastFrame && len(input.Keyframes) == 0 {
+			return media.Job{}, fmt.Errorf("文本生视频必须提供 prompt；图片、参考图或定帧视频可以省略 prompt")
 		}
 		if strings.TrimSpace(input.VideoURL) != "" {
 			return media.Job{}, fmt.Errorf("视频生成不支持 video 输入")
@@ -138,11 +142,16 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	if err != nil {
 		return media.Job{}, err
 	}
-	routes, err = routesForVideoParameters(routes, operation, input.Resolution, strings.TrimSpace(input.ImageURL) != "", len(input.ReferenceURLs), input.Duration)
+	routes, err = routesForVideoSpec(routes, operation, videoRouteSpec{
+		Resolution: input.Resolution, HasImage: strings.TrimSpace(input.ImageURL) != "",
+		ReferenceCount: len(input.ReferenceURLs), Duration: input.Duration,
+		HasReferenceAudio: len(input.ReferenceAudios) > 0,
+		HasLastFrame:      strings.TrimSpace(input.LastFrameURL) != "", KeyframeCount: len(input.Keyframes),
+	})
 	if err != nil {
 		return media.Job{}, err
 	}
-	allRefs := videoInputReferences(input.ImageURL, input.ReferenceURLs)
+	allRefs := videoInputReferences(input.ImageURL, videoGuidanceReferences(input))
 	if err := s.validateVideoInputReferences(ctx, allRefs, "image"); err != nil {
 		return media.Job{}, err
 	}
@@ -151,7 +160,7 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 			return media.Job{}, err
 		}
 	}
-	inputJSON, err := encodeVideoInputFull(operation, input.ImageURL, input.ReferenceURLs, input.ReferenceAudios, input.VideoURL)
+	inputJSON, err := encodeVideoJobInput(operation, input)
 	if err != nil {
 		return media.Job{}, err
 	}
@@ -209,14 +218,30 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 // Callers must first apply capability, client-key, and Provider eligibility:
 // the same public model may aggregate Console, Build, and Web routes with
 // different input contracts.
+type videoRouteSpec struct {
+	Resolution        string
+	HasImage          bool
+	ReferenceCount    int
+	Duration          int
+	HasReferenceAudio bool
+	HasLastFrame      bool
+	KeyframeCount     int
+}
+
 func routesForVideoParameters(routes []model.Route, operation provider.VideoOperation, resolution string, hasImage bool, referenceCount, duration int) ([]model.Route, error) {
+	return routesForVideoSpec(routes, operation, videoRouteSpec{
+		Resolution: resolution, HasImage: hasImage, ReferenceCount: referenceCount, Duration: duration,
+	})
+}
+
+func routesForVideoSpec(routes []model.Route, operation provider.VideoOperation, spec videoRouteSpec) ([]model.Route, error) {
 	if len(routes) == 0 {
 		return routes, nil
 	}
 	compatible := make([]model.Route, 0, len(routes))
 	var firstErr error
 	for _, candidate := range routes {
-		if err := validateVideoRouteParameters(candidate.Provider, operation, candidate.UpstreamModel, resolution, hasImage, referenceCount, duration); err != nil {
+		if err := validateVideoRouteSpec(candidate.Provider, operation, candidate.UpstreamModel, spec); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -234,37 +259,62 @@ func routesForVideoParameters(routes []model.Route, operation provider.VideoOper
 // /v1/videos/generations 是异步接口，只在 adapter 层拦截会产出必然失败的任务；
 // adapter 仍保留同一约束，作为最终出站边界的防御校验。
 func validateVideoRouteParameters(providerValue account.Provider, operation provider.VideoOperation, upstreamModel, resolution string, hasImage bool, referenceCount, duration int) error {
+	return validateVideoRouteSpec(providerValue, operation, upstreamModel, videoRouteSpec{
+		Resolution: resolution, HasImage: hasImage, ReferenceCount: referenceCount, Duration: duration,
+	})
+}
+
+func validateVideoRouteSpec(providerValue account.Provider, operation provider.VideoOperation, upstreamModel string, spec videoRouteSpec) error {
 	if operation != provider.VideoOperationGenerate {
 		return nil
 	}
 	trimmedModel := strings.TrimSpace(upstreamModel)
-	hasReferences := referenceCount > 0
-	if providerValue == account.ProviderWeb && (hasImage || hasReferences) {
+	hasReferences := spec.ReferenceCount > 0
+	imagine15 := provider.VideoModelIsImagine15(trimmedModel)
+	if providerValue == account.ProviderWeb && (spec.HasImage || hasReferences || spec.HasReferenceAudio || spec.HasLastFrame || spec.KeyframeCount > 0) {
 		return fmt.Errorf("%w: Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider", ErrVideoOperationUnsupported)
 	}
-	if providerValue == account.ProviderConsole && (trimmedModel == "grok-imagine-video" || trimmedModel == "grok-imagine-video-1.5") {
-		// 实测：8 张 reference_images 上游回 400
-		// "Too many reference images: 8. Maximum allowed is 7."（两个视频模型一致）。
-		if referenceCount > provider.ConsoleVideoMaxReferenceImages {
-			return fmt.Errorf("%w: Console reference_images 最多 %d 张，当前为 %d 张", ErrVideoParameterInvalid, provider.ConsoleVideoMaxReferenceImages, referenceCount)
+	if !imagine15 {
+		if spec.HasLastFrame || spec.KeyframeCount > 0 {
+			return fmt.Errorf("%w: %s 不支持 last_frame 或 keyframes", ErrVideoOperationUnsupported, trimmedModel)
 		}
-		// 实测：grok-imagine-video 的 reference-to-video 上游回 400
-		// "Duration 15s exceeds the maximum allowed for reference-to-video, which is 10s."；
-		// 走 image 字段的 image-to-video 与 grok-imagine-video-1.5 都保持 15s。
-		if trimmedModel == "grok-imagine-video" && hasReferences && duration > provider.ConsoleVideoMaxReferenceDurationSeconds {
-			return fmt.Errorf("%w: Console %s 的参考图生视频最长 %d 秒，当前为 %d 秒", ErrVideoParameterInvalid, trimmedModel, provider.ConsoleVideoMaxReferenceDurationSeconds, duration)
+		if spec.HasReferenceAudio {
+			return fmt.Errorf("%w: %s 不支持 reference_audios", ErrVideoOperationUnsupported, trimmedModel)
+		}
+		if spec.HasImage && hasReferences {
+			return fmt.Errorf("%w: image 不能与 reference_images 同时使用", ErrVideoParameterInvalid)
 		}
 	}
-	if !strings.EqualFold(strings.TrimSpace(resolution), "1080p") {
+	if providerValue == account.ProviderConsole && (trimmedModel == "grok-imagine-video" || imagine15) {
+		// Official caps: grok-imagine-video reference_images <= 7,
+		// grok-imagine-video-1.5 reference_images <= 14.
+		limit := provider.ConsoleReferenceImageLimit(trimmedModel)
+		if spec.ReferenceCount > limit {
+			return fmt.Errorf("%w: Console reference_images 最多 %d 张，当前为 %d 张", ErrVideoParameterInvalid, limit, spec.ReferenceCount)
+		}
+		// grok-imagine-video reference-to-video stays at 10s.
+		// image-to-video and grok-imagine-video-1.5 keep the 15s generation cap.
+		if trimmedModel == "grok-imagine-video" && hasReferences && spec.Duration > provider.ConsoleVideoMaxReferenceDurationSeconds {
+			return fmt.Errorf("%w: Console %s 的参考图生视频最长 %d 秒，当前为 %d 秒", ErrVideoParameterInvalid, trimmedModel, provider.ConsoleVideoMaxReferenceDurationSeconds, spec.Duration)
+		}
+	}
+	if !strings.EqualFold(strings.TrimSpace(spec.Resolution), "1080p") {
 		return nil
 	}
-	if trimmedModel != "grok-imagine-video-1.5" {
+	if !imagine15 {
 		return fmt.Errorf("%w: %s 不支持 1080p", ErrVideoOperationUnsupported, upstreamModel)
 	}
-	if hasReferences {
+	if provider.VideoUsesReferenceMode(spec.ReferenceCount, boolToInt(spec.HasReferenceAudio), spec.HasLastFrame, spec.KeyframeCount) {
 		return fmt.Errorf("%w: reference_images 模式最高支持 720p", ErrVideoOperationUnsupported)
 	}
 	return nil
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func routesForVideoOperation(routes []model.Route, operation provider.VideoOperation) ([]model.Route, error) {
@@ -519,6 +569,29 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		s.failVideoJob(parent, job, "input_unavailable", err, 0, nil)
 		return
 	}
+	lastFrameURL, keyframes, generateAudio := decodeVideoPinnedInput(job.InputJSON)
+	if strings.TrimSpace(lastFrameURL) != "" {
+		resolved, resolveErr := s.resolveVideoInputReferences(ctx, []string{lastFrameURL}, "image")
+		if resolveErr != nil || len(resolved) == 0 {
+			if resolveErr == nil {
+				resolveErr = ErrVideoInputUnavailable
+			}
+			s.failVideoJob(parent, job, "input_unavailable", resolveErr, 0, nil)
+			return
+		}
+		lastFrameURL = resolved[0]
+	}
+	for index := range keyframes {
+		resolved, resolveErr := s.resolveVideoInputReferences(ctx, []string{keyframes[index].ImageURL}, "image")
+		if resolveErr != nil || len(resolved) == 0 {
+			if resolveErr == nil {
+				resolveErr = ErrVideoInputUnavailable
+			}
+			s.failVideoJob(parent, job, "input_unavailable", resolveErr, 0, nil)
+			return
+		}
+		keyframes[index].ImageURL = resolved[0]
+	}
 	duration := job.Seconds
 	aspectRatio := job.Size
 	resolution := job.Quality
@@ -624,7 +697,8 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 			Credential: lease.Credential, Billing: lease.Billing, JobID: job.ID, Model: route.UpstreamModel,
 			Operation: operation,
 			Prompt:    job.Prompt, Duration: duration, AspectRatio: aspectRatio, Resolution: resolution,
-			ImageURL: imageURL, ReferenceURLs: referenceURLs, ReferenceAudios: referenceAudios, VideoURL: videoURL,
+			ImageURL: imageURL, ReferenceURLs: referenceURLs, ReferenceAudios: referenceAudios,
+			LastFrameURL: lastFrameURL, Keyframes: keyframes, GenerateAudio: generateAudio, VideoURL: videoURL,
 			Progress: func(value int) {
 				value = min(99, max(1, value))
 				if value-lastProgress < 5 {
@@ -1055,7 +1129,15 @@ func encodeVideoInput(imageURL string, referenceURLs []string) (string, error) {
 	return encodeVideoInputFull(provider.VideoOperationGenerate, imageURL, referenceURLs, nil, "")
 }
 
+func encodeVideoJobInput(operation provider.VideoOperation, input VideoInput) (string, error) {
+	return encodeVideoInputState(operation, input.ImageURL, input.ReferenceURLs, input.ReferenceAudios, input.VideoURL, input.LastFrameURL, input.Keyframes, input.GenerateAudio)
+}
+
 func encodeVideoInputFull(operation provider.VideoOperation, imageURL string, referenceURLs []string, referenceAudios []string, videoURL string) (string, error) {
+	return encodeVideoInputState(operation, imageURL, referenceURLs, referenceAudios, videoURL, "", nil, nil)
+}
+
+func encodeVideoInputState(operation provider.VideoOperation, imageURL string, referenceURLs []string, referenceAudios []string, videoURL, lastFrameURL string, keyframes []provider.VideoKeyframe, generateAudio *bool) (string, error) {
 	payload := map[string]any{}
 	if operation == "" {
 		operation = provider.VideoOperationGenerate
@@ -1065,6 +1147,19 @@ func encodeVideoInputFull(operation provider.VideoOperation, imageURL string, re
 	}
 	if value := strings.TrimSpace(imageURL); value != "" {
 		payload["image_url"] = value
+	}
+	if value := strings.TrimSpace(lastFrameURL); value != "" {
+		payload["last_frame_url"] = value
+	}
+	if len(keyframes) > 0 {
+		encodedFrames := make([]map[string]any, 0, len(keyframes))
+		for _, frame := range keyframes {
+			encodedFrames = append(encodedFrames, map[string]any{"image_url": strings.TrimSpace(frame.ImageURL), "timestamp_s": frame.TimestampS})
+		}
+		payload["keyframes"] = encodedFrames
+	}
+	if generateAudio != nil {
+		payload["generate_audio"] = *generateAudio
 	}
 	refs := make([]string, 0, len(referenceURLs))
 	for _, raw := range referenceURLs {
@@ -1101,6 +1196,15 @@ func encodeVideoInputFull(operation provider.VideoOperation, imageURL string, re
 func decodeVideoInput(value string) []string {
 	imageURL, refs, videoURL := decodeVideoInputFull(value)
 	values := videoInputReferences(imageURL, refs)
+	lastFrameURL, keyframes, _ := decodeVideoPinnedInput(value)
+	if lastFrameURL != "" {
+		values = append(values, lastFrameURL)
+	}
+	for _, frame := range keyframes {
+		if frame.ImageURL != "" {
+			values = append(values, frame.ImageURL)
+		}
+	}
 	if v := strings.TrimSpace(videoURL); v != "" {
 		values = append(values, v)
 	}
@@ -1213,6 +1317,39 @@ func normalizeVideoReferenceAudios(values []string) []string {
 		}
 	}
 	return out
+}
+
+func decodeVideoPinnedInput(value string) (string, []provider.VideoKeyframe, *bool) {
+	var input struct {
+		LastFrameURL  string `json:"last_frame_url"`
+		GenerateAudio *bool  `json:"generate_audio"`
+		Keyframes     []struct {
+			ImageURL   string  `json:"image_url"`
+			TimestampS float64 `json:"timestamp_s"`
+		} `json:"keyframes"`
+	}
+	_ = json.Unmarshal([]byte(value), &input)
+	frames := make([]provider.VideoKeyframe, 0, len(input.Keyframes))
+	for _, frame := range input.Keyframes {
+		if imageURL := strings.TrimSpace(frame.ImageURL); imageURL != "" {
+			frames = append(frames, provider.VideoKeyframe{ImageURL: imageURL, TimestampS: frame.TimestampS})
+		}
+	}
+	return strings.TrimSpace(input.LastFrameURL), frames, input.GenerateAudio
+}
+
+func videoGuidanceReferences(input VideoInput) []string {
+	values := make([]string, 0, len(input.ReferenceURLs)+1+len(input.Keyframes))
+	values = append(values, input.ReferenceURLs...)
+	if value := strings.TrimSpace(input.LastFrameURL); value != "" {
+		values = append(values, value)
+	}
+	for _, frame := range input.Keyframes {
+		if value := strings.TrimSpace(frame.ImageURL); value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
 }
 
 func videoInputReferences(imageURL string, referenceURLs []string) []string {

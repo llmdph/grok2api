@@ -185,19 +185,27 @@ type videoGenerationAudio struct {
 	VoiceID string `json:"voice_id"`
 }
 
+type videoGenerationKeyframe struct {
+	Image      videoGenerationImage `json:"image"`
+	TimestampS float64              `json:"timestamp_s"`
+}
+
 type videoGenerationRequest struct {
-	Model           string                 `json:"model"`
-	Prompt          string                 `json:"prompt"`
-	User            *string                `json:"user"`
-	Duration        json.RawMessage        `json:"duration"`
-	AspectRatio     string                 `json:"aspect_ratio"`
-	Resolution      string                 `json:"resolution"`
-	Image           *videoGenerationImage  `json:"image"`
-	ReferenceImages []videoGenerationImage `json:"reference_images"`
-	ReferenceAudios []videoGenerationAudio `json:"reference_audios"`
-	Video           *videoGenerationImage  `json:"video"`
-	Output          json.RawMessage        `json:"output"`
-	StorageOptions  json.RawMessage        `json:"storage_options"`
+	Model           string                    `json:"model"`
+	Prompt          string                    `json:"prompt"`
+	User            *string                   `json:"user"`
+	Duration        json.RawMessage           `json:"duration"`
+	AspectRatio     string                    `json:"aspect_ratio"`
+	Resolution      string                    `json:"resolution"`
+	Image           *videoGenerationImage     `json:"image"`
+	ReferenceImages []videoGenerationImage    `json:"reference_images"`
+	ReferenceAudios []videoGenerationAudio    `json:"reference_audios"`
+	LastFrame       *videoGenerationImage     `json:"last_frame"`
+	Keyframes       []videoGenerationKeyframe `json:"keyframes"`
+	GenerateAudio   *bool                     `json:"generate_audio"`
+	Video           *videoGenerationImage     `json:"video"`
+	Output          json.RawMessage           `json:"output"`
+	StorageOptions  json.RawMessage           `json:"storage_options"`
 }
 
 type modelListItem struct {
@@ -783,6 +791,8 @@ func (h *Handler) handleVideoCreate(c *gin.Context, operation, label string) {
 	imageURL := ""
 	referenceURLs := []string{}
 	referenceAudios := []string{}
+	lastFrameURL := ""
+	keyframes := []provider.VideoKeyframe{}
 	videoURL := ""
 
 	if operation == gatewayVideoOperationGenerate {
@@ -797,12 +807,12 @@ func (h *Handler) handleVideoCreate(c *gin.Context, operation, label string) {
 			aspectRatio = "16:9"
 		}
 		if !validVideoAspectRatio(aspectRatio) {
-			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "aspect_ratio 必须是 1:1、16:9、9:16、4:3、3:4、3:2 或 2:3")
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "aspect_ratio 必须是 1:1、16:9、9:16、4:3、3:4、3:2、2:3、21:9 或 5:2")
 			return
 		}
 		resolution = strings.ToLower(strings.TrimSpace(request.Resolution))
 		if resolution == "" {
-			resolution = "720p"
+			resolution = "480p"
 		}
 		if resolution != "480p" && resolution != "720p" && resolution != "1080p" {
 			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "resolution 必须是 480p、720p 或 1080p")
@@ -836,27 +846,40 @@ func (h *Handler) handleVideoCreate(c *gin.Context, operation, label string) {
 			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "reference_audios 最多 3 个")
 			return
 		}
-		if imageURL != "" && (len(referenceURLs) > 0 || len(referenceAudios) > 0) {
-			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 不能与 reference_images/reference_audios 同时使用")
+		if request.LastFrame != nil {
+			value, ok := parseVideoImage(*request.LastFrame, "last_frame")
+			if !ok {
+				return
+			}
+			lastFrameURL = value
+		}
+		if len(request.Keyframes) > provider.VideoMaxKeyframes {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("keyframes 最多 %d 个", provider.VideoMaxKeyframes))
+			return
+		}
+		keyframes = make([]provider.VideoKeyframe, 0, len(request.Keyframes))
+		for index, frame := range request.Keyframes {
+			value, ok := parseVideoImage(frame.Image, fmt.Sprintf("keyframes[%d].image", index))
+			if !ok {
+				return
+			}
+			keyframes = append(keyframes, provider.VideoKeyframe{ImageURL: value, TimestampS: frame.TimestampS})
+		}
+		if err := provider.ValidateVideoKeyframes(keyframes, duration); err != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
 		if len(referenceURLs) > mediadomain.MaxInputImages {
 			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("reference_images 不能超过 %d 张", mediadomain.MaxInputImages))
 			return
 		}
-		hasReferenceMode := len(referenceURLs) > 0 || len(referenceAudios) > 0
-		if hasReferenceMode {
-			if prompt == "" {
-				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "参考图/参考音频视频必须提供 prompt")
-				return
-			}
-			if resolution == "1080p" {
-				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "参考图视频 resolution 最高 720p")
-				return
-			}
+		hasReferenceMode := provider.VideoUsesReferenceMode(len(referenceURLs), len(referenceAudios), lastFrameURL != "", len(keyframes))
+		if hasReferenceMode && resolution == "1080p" {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "参考图视频 resolution 最高 720p")
+			return
 		}
 		if prompt == "" && imageURL == "" && !hasReferenceMode {
-			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "文本生视频必须提供 prompt；图片生视频可以省略 prompt")
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "文本生视频必须提供 prompt；图片、参考图或定帧视频可以省略 prompt")
 			return
 		}
 		if request.Video != nil {
@@ -877,8 +900,8 @@ func (h *Handler) handleVideoCreate(c *gin.Context, operation, label string) {
 			return
 		}
 		videoURL = value
-		if request.Image != nil || len(request.ReferenceImages) > 0 || len(request.ReferenceAudios) > 0 {
-			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", label+"不支持 image、reference_images 或 reference_audios")
+		if request.Image != nil || len(request.ReferenceImages) > 0 || len(request.ReferenceAudios) > 0 || request.LastFrame != nil || len(request.Keyframes) > 0 || request.GenerateAudio != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", label+"不支持 image、reference_images、reference_audios、last_frame、keyframes 或 generate_audio")
 			return
 		}
 		if strings.TrimSpace(request.AspectRatio) != "" || strings.TrimSpace(request.Resolution) != "" {
@@ -926,7 +949,8 @@ func (h *Handler) handleVideoCreate(c *gin.Context, operation, label string) {
 		RequestID: requestID, ClientKey: clientKey, PublicModel: model,
 		Operation: op,
 		Prompt:    prompt, Duration: duration, AspectRatio: aspectRatio, Resolution: resolution,
-		ImageURL: imageURL, ReferenceURLs: referenceURLs, ReferenceAudios: referenceAudios, VideoURL: videoURL,
+		ImageURL: imageURL, ReferenceURLs: referenceURLs, ReferenceAudios: referenceAudios,
+		LastFrameURL: lastFrameURL, Keyframes: keyframes, GenerateAudio: request.GenerateAudio, VideoURL: videoURL,
 	})
 	if err != nil {
 		writeGatewayError(c, err)
@@ -1073,7 +1097,7 @@ func hasJSONValue(value json.RawMessage) bool {
 
 func validVideoAspectRatio(value string) bool {
 	switch value {
-	case "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3":
+	case "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9", "5:2":
 		return true
 	default:
 		return false

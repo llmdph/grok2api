@@ -1,11 +1,11 @@
 package gateway
 
 import (
-	"io"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -307,6 +307,39 @@ func (s *Service) executeImage(
 				lease.Release()
 				continue
 			}
+		}
+		// 402 is an account billing failure. Rotate even when upstream sends
+		// X-Should-Retry: false; another credential can still serve this image.
+		if response.StatusCode == http.StatusPaymentRequired {
+			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
+			body, _ := readRetryableBody(response.Body)
+			if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && lease.QuotaMode != "" {
+				state, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+				s.applyRateLimitReconciliation(ctx, credential, response.StatusCode, retryAfter, state, reconcileErr)
+			} else {
+				classified := newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+				if classified.SpendingLimitBlocked || classified.QuotaExhausted {
+					if err := s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{Billing: lease.Billing}); err != nil {
+						s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+					}
+				} else {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
+			}
+			response.Body = io.NopCloser(bytes.NewReader(body))
+			if attemptPolicy.hasNext(attempt) && selection != nil && selection.hasAvailableCandidate(excluded, false) {
+				_, _ = readRetryableBody(response.Body)
+				failedCredential := credential
+				lastCredentialFailure = &failedCredential
+				lastCredentialError = fmt.Errorf("upstream status %d", response.StatusCode)
+				lease.Release()
+				continue
+			}
+		}
+		if response.StatusCode >= http.StatusInternalServerError && attemptPolicy.hasNext(attempt) && selection != nil && selection.hasAvailableCandidate(excluded, false) {
+			_, _ = readRetryableBody(response.Body)
+			lease.Release()
+			continue
 		}
 		break
 	}

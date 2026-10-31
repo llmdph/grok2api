@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -559,8 +560,13 @@ const (
 // asynchronous jobs are rejected before enqueueing without weakening the
 // adapter's final request-boundary validation.
 const (
+	// ConsoleVideoMaxReferenceImages is the grok-imagine-video reference-image cap.
+	// grok-imagine-video-1.5 raises that cap to ConsoleVideo15MaxReferenceImages.
 	ConsoleVideoMaxReferenceImages          = 7
+	ConsoleVideo15MaxReferenceImages        = 14
 	ConsoleVideoMaxReferenceDurationSeconds = 10
+	VideoMaxKeyframes                       = 4
+	VideoMaxReferenceAudios                 = 3
 )
 
 type VideoRequest struct {
@@ -581,14 +587,82 @@ type VideoRequest struct {
 	ImageURL string
 	// ReferenceURLs are style/content references (official "reference_images").
 	// A single reference must stay in reference_images and must not be coerced to image.
-	// Official docs forbid combining image with reference_images.
+	// grok-imagine-video still rejects combining image with reference inputs.
+	// grok-imagine-video-1.5 accepts that combination as a pinned first frame.
 	ReferenceURLs []string
 	// ReferenceAudios are preset voice_ids for reference-to-video (official "reference_audios").
-	// At most 3 entries; may be used alone or with reference_images.
+	// At most 3 entries on grok-imagine-video-1.5; may be used alone or with reference images.
 	ReferenceAudios []string
+	// LastFrameURL pins the exact closing frame. grok-imagine-video-1.5 only.
+	LastFrameURL string
+	// Keyframes pin images strictly inside the clip. grok-imagine-video-1.5 only, at most 4.
+	Keyframes []VideoKeyframe
+	// GenerateAudio overrides the default soundtrack. Nil keeps the upstream default (with audio).
+	GenerateAudio *bool
 	// VideoURL is required for edit/extend (official "video" field).
 	VideoURL string
 	Progress func(int)
+}
+
+// VideoKeyframe is one interior pin for grok-imagine-video-1.5.
+type VideoKeyframe struct {
+	ImageURL   string
+	TimestampS float64
+}
+
+// VideoModelIsImagine15 reports models that accept pinned frames, preset voices,
+// and up to 14 reference images. Classic grok-imagine-video does not.
+func VideoModelIsImagine15(model string) bool {
+	switch strings.TrimSpace(model) {
+	case "grok-imagine-video-1.5", "grok-imagine-video-1.5-lite", "grok-imagine-video-1.5-preview":
+		return true
+	default:
+		return false
+	}
+}
+
+// ConsoleReferenceImageLimit is the official reference_images cap for a video model.
+func ConsoleReferenceImageLimit(model string) int {
+	if VideoModelIsImagine15(model) {
+		return ConsoleVideo15MaxReferenceImages
+	}
+	return ConsoleVideoMaxReferenceImages
+}
+
+// VideoUsesReferenceMode is true when the clip is guided by references or pinned
+// interior/end frames. Plain image-to-video (image only) is not reference mode.
+func VideoUsesReferenceMode(referenceImages, referenceAudios int, hasLastFrame bool, keyframes int) bool {
+	return referenceImages > 0 || referenceAudios > 0 || hasLastFrame || keyframes > 0
+}
+
+// ValidateVideoKeyframes checks the official interior-pin contract: at most 4
+// images, each timestamp strictly inside the clip, snapped to a 1/3-second grid.
+func ValidateVideoKeyframes(frames []VideoKeyframe, duration int) error {
+	if len(frames) > VideoMaxKeyframes {
+		return fmt.Errorf("keyframes 最多 %d 个", VideoMaxKeyframes)
+	}
+	if duration <= 0 {
+		duration = 8
+	}
+	seen := make(map[int]struct{}, len(frames))
+	limit := duration * 3
+	for _, frame := range frames {
+		if strings.TrimSpace(frame.ImageURL) == "" {
+			return errors.New("keyframes.image 必须提供 url 或 file_id")
+		}
+		if math.IsNaN(frame.TimestampS) || math.IsInf(frame.TimestampS, 0) || frame.TimestampS <= 0 || frame.TimestampS >= float64(duration) {
+			return fmt.Errorf("keyframes.timestamp_s 必须大于 0 且小于 duration（%d 秒）", duration)
+		}
+		slot := int(math.Round(frame.TimestampS * 3))
+		if slot <= 0 || slot >= limit {
+			return errors.New("keyframes.timestamp_s 对齐到 1/3 秒后必须落在视频内部")
+		}
+		if _, exists := seen[slot]; exists {
+			return errors.New("keyframes 对齐到 1/3 秒后不能落在同一时刻")
+		}
+		seen[slot] = struct{}{}
+	}
+	return nil
 }
 
 type VideoResult struct {
@@ -718,10 +792,10 @@ type CustomVoiceUpdateRequest struct {
 }
 
 type RealtimeClientSecretRequest struct {
-	Credential    account.Credential
-	Model         string
-	ExpiresAfter  int
-	SessionJSON   []byte
+	Credential   account.Credential
+	Model        string
+	ExpiresAfter int
+	SessionJSON  []byte
 }
 
 type RealtimeClientSecretResult struct {

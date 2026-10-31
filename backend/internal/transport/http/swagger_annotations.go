@@ -63,17 +63,28 @@ type SwaggerImageEditRequest struct {
 }
 
 // SwaggerVideoGenerationRequest 表示视频生成请求。
-// image 与 reference_images/reference_audios 互斥；参考图模式 resolution 最高 720p。
+// grok-imagine-video 不能把 image 和 reference_images 一起用。
+// grok-imagine-video-1.5 可以把 image 当作首帧，并加上 reference_images、last_frame、keyframes。
+// 参考图、参考音频、尾帧和关键帧的 resolution 最高 720p。
 type SwaggerVideoGenerationRequest struct {
-	Model            string                    `json:"model" example:"grok-imagine-video"`
-	Prompt           string                    `json:"prompt" example:"A cinematic tracking shot in the rain"`
-	Duration         int                       `json:"duration" example:"8"`
-	AspectRatio      string                    `json:"aspect_ratio,omitempty" example:"16:9"`
-	Resolution       string                    `json:"resolution,omitempty" example:"720p"`
-	Image            *SwaggerVideoMediaInput   `json:"image,omitempty"`
-	ReferenceImages  []SwaggerVideoMediaInput  `json:"reference_images,omitempty"`
-	ReferenceAudios  []SwaggerVideoAudioInput  `json:"reference_audios,omitempty"`
-	Video            *SwaggerVideoMediaInput   `json:"video,omitempty"`
+	Model           string                   `json:"model" example:"grok-imagine-video-1.5"`
+	Prompt          string                   `json:"prompt" example:"A cinematic tracking shot in the rain"`
+	Duration        int                      `json:"duration" example:"8"`
+	AspectRatio     string                   `json:"aspect_ratio,omitempty" example:"16:9"`
+	Resolution      string                   `json:"resolution,omitempty" example:"480p"`
+	GenerateAudio   *bool                    `json:"generate_audio,omitempty" example:"false"`
+	Image           *SwaggerVideoMediaInput  `json:"image,omitempty"`
+	LastFrame       *SwaggerVideoMediaInput  `json:"last_frame,omitempty"`
+	Keyframes       []SwaggerVideoKeyframe   `json:"keyframes,omitempty"`
+	ReferenceImages []SwaggerVideoMediaInput `json:"reference_images,omitempty"`
+	ReferenceAudios []SwaggerVideoAudioInput `json:"reference_audios,omitempty"`
+	Video           *SwaggerVideoMediaInput  `json:"video,omitempty"`
+}
+
+// SwaggerVideoKeyframe 表示视频内部的定帧。
+type SwaggerVideoKeyframe struct {
+	Image      SwaggerVideoMediaInput `json:"image"`
+	TimestampS float64                `json:"timestamp_s" example:"2"`
 }
 
 // SwaggerVideoMediaInput 表示视频相关的图片/视频输入。

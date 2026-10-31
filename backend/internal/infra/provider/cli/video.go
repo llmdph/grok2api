@@ -157,7 +157,7 @@ func boundDiagnosticText(value string, limit int) string {
 // 其他 auto Super 账号仅在当次 Build 创建返回 403 后探测 XAI。
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
 	if total := buildVideoImageCount(request); total > buildVideoMaxImages {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Build grok-imagine-video-1.5 最多支持 %d 张输入图，当前为 %d 张", buildVideoMaxImages, total))
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Build grok-imagine-video-1.5 最多支持 %d 张参考图，当前为 %d 张", buildVideoMaxImages, total))
 	}
 	accessToken, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
 	if err != nil {
@@ -294,11 +294,25 @@ func videoCreatePayload(request provider.VideoRequest, uploadURL string, profile
 	if resolution := strings.TrimSpace(request.Resolution); resolution != "" {
 		payload["resolution"] = resolution
 	}
+	modelName := strings.TrimSpace(request.Model)
+	if modelName == "" {
+		modelName = profile.model
+	}
+	imagine15 := provider.VideoModelIsImagine15(modelName)
+	referenceMode := provider.VideoUsesReferenceMode(len(request.ReferenceURLs), len(request.ReferenceAudios), strings.TrimSpace(request.LastFrameURL) != "", len(request.Keyframes))
+	if !imagine15 {
+		if strings.TrimSpace(request.LastFrameURL) != "" || len(request.Keyframes) > 0 || len(request.ReferenceAudios) > 0 {
+			return nil, fmt.Errorf("%s 不支持 last_frame、keyframes 或 reference_audios", modelName)
+		}
+		if strings.TrimSpace(request.ImageURL) != "" && len(request.ReferenceURLs) > 0 {
+			return nil, fmt.Errorf("image 不能与 reference_images 同时使用")
+		}
+	}
+	if err := provider.ValidateVideoKeyframes(request.Keyframes, request.Duration); err != nil {
+		return nil, err
+	}
 	if imageURL := strings.TrimSpace(request.ImageURL); imageURL != "" {
 		payload["image"] = map[string]any{profile.imageURLField: imageURL}
-	}
-	if strings.TrimSpace(request.ImageURL) != "" && (len(request.ReferenceURLs) > 0 || len(request.ReferenceAudios) > 0) {
-		return nil, fmt.Errorf("image 不能与 reference_images/reference_audios 同时使用")
 	}
 	if len(request.ReferenceURLs) > 0 {
 		references := make([]map[string]any, 0, len(request.ReferenceURLs))
@@ -326,20 +340,32 @@ func videoCreatePayload(request provider.VideoRequest, uploadURL string, profile
 		}
 		payload["reference_audios"] = audios
 	}
-	hasReferenceMode := len(request.ReferenceURLs) > 0 || len(request.ReferenceAudios) > 0
-	if hasReferenceMode {
-		if strings.TrimSpace(request.Prompt) == "" {
-			return nil, fmt.Errorf("参考图/参考音频视频必须提供 prompt")
+	if lastFrameURL := strings.TrimSpace(request.LastFrameURL); lastFrameURL != "" {
+		payload["last_frame"] = map[string]any{profile.imageURLField: lastFrameURL}
+	}
+	if len(request.Keyframes) > 0 {
+		frames := make([]map[string]any, 0, len(request.Keyframes))
+		for _, frame := range request.Keyframes {
+			imageURL := strings.TrimSpace(frame.ImageURL)
+			if imageURL == "" {
+				return nil, fmt.Errorf("关键帧图片 URL 不能为空")
+			}
+			frames = append(frames, map[string]any{
+				"image":       map[string]any{profile.imageURLField: imageURL},
+				"timestamp_s": frame.TimestampS,
+			})
 		}
-		if strings.EqualFold(strings.TrimSpace(request.Resolution), "1080p") {
-			return nil, fmt.Errorf("参考图视频 resolution 最高 720p")
-		}
+		payload["keyframes"] = frames
+	}
+	if request.GenerateAudio != nil {
+		payload["generate_audio"] = *request.GenerateAudio
+	}
+	if referenceMode && strings.EqualFold(strings.TrimSpace(request.Resolution), "1080p") {
+		return nil, fmt.Errorf("参考图视频 resolution 最高 720p")
 	}
 	if _, hasPrompt := payload["prompt"]; !hasPrompt {
-		if _, hasImage := payload["image"]; !hasImage {
-			if !hasReferenceMode {
-				return nil, fmt.Errorf("文本生视频必须提供 prompt；图片生视频可以省略 prompt")
-			}
+		if _, hasImage := payload["image"]; !hasImage && !referenceMode {
+			return nil, fmt.Errorf("文本生视频必须提供 prompt；图片、参考图或定帧视频可以省略 prompt")
 		}
 	}
 	if uploadURL = strings.TrimSpace(uploadURL); uploadURL != "" {
@@ -597,9 +623,6 @@ func numberAsInt(value any) (int, bool) {
 
 func buildVideoImageCount(request provider.VideoRequest) int {
 	count := 0
-	if strings.TrimSpace(request.ImageURL) != "" {
-		count++
-	}
 	for _, raw := range request.ReferenceURLs {
 		if strings.TrimSpace(raw) != "" {
 			count++
